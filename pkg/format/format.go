@@ -152,6 +152,13 @@ func (lbf *LockboxFile) NewWriter(password string) (*Writer, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to create encryptor for column %s: %w", field.Name, err)
 		}
+
+		// Initialize post-quantum components
+		if masterKey.KyberPublicKey != nil && masterKey.KyberSecretKey != nil {
+			encryptor.KyberPublicKey = masterKey.KyberPublicKey
+			encryptor.KyberSecretKey = masterKey.KyberSecretKey
+		}
+
 		encryptors[field.Name] = encryptor
 		log.Debug().Str("column", field.Name).Int("index", i).Msg("Created column encryptor")
 	}
@@ -179,6 +186,13 @@ func (lbf *LockboxFile) NewReader(password string) (*Reader, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to create encryptor for column %s: %w", field.Name, err)
 		}
+
+		// Initialize post-quantum components
+		if masterKey.KyberPublicKey != nil && masterKey.KyberSecretKey != nil {
+			encryptor.KyberPublicKey = masterKey.KyberPublicKey
+			encryptor.KyberSecretKey = masterKey.KyberSecretKey
+		}
+
 		encryptors[field.Name] = encryptor
 		log.Debug().Str("column", field.Name).Int("index", i).Msg("Created column encryptor")
 	}
