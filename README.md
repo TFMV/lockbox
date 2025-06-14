@@ -212,4 +212,57 @@ The MVP implementation focuses on correctness and security while maintaining rea
 
 Create a new lockbox file with specified schema.
 
+```bash
+lockbox create [file] --password [password] [options]
+
+Options:
+  -s, --schema string      JSON schema file
+  -p, --password string    Password for encryption (required)
+      --created-by string  Creator name (default "system")
+```
+
+#### `write`
+
+Write data to an existing lockbox file.
+
+```bash
+lockbox write [file] --password [password] [options]
+
+Options:
+  -i, --input string     Input data file (CSV, JSON)
+  -p, --password string  Password for encryption
+      --sample           Generate sample data
+```
+
+#### `query`
+
+Query data from a lockbox file.
+
+```bash
+lockbox query [file] --password [password] [options]
+
+Options:
+  -q, --sql string       SQL query to execute (default "SELECT * FROM data")
+  -p, --password string  Password for decryption
+  -o, --output string    Output format (table, json, csv) (default "table")
+```
+
+#### `info`
+
+Display information about a lockbox file.
+
+```bash
+lockbox info [file] --password [password] [options]
+
+Options:
+  -p, --password string  Password for decryption
+  -o, --output string    Output format (table, json) (default "table")
+```
+
+### Global Options
+
+```bash
+Options:
+  -v, --verbose          Enable verbose output
+      --config string    Config file (default is $HOME/.lockbox.yaml)
 ```
