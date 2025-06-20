@@ -1,0 +1,9 @@
+{
+  "fields": [
+    {"name": "user_id", "type": "int64", "nullable": false},
+    {"name": "username", "type": "string", "nullable": false},
+    {"name": "email", "type": "string", "nullable": true},
+    {"name": "created_at", "type": "timestamp", "nullable": false},
+    {"name": "score", "type": "float64", "nullable": true}
+  ]
+}
