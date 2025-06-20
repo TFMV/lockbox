@@ -395,7 +395,7 @@ func (r *Reader) ReadColumns(columns []string) (arrow.Record, error) {
 
 	schema := r.file.metadata.Schema
 
-	for i, field := range schema.Fields() {
+	for _, field := range schema.Fields() {
 		if len(colSet) > 0 {
 			if _, ok := colSet[field.Name]; !ok {
 				continue
