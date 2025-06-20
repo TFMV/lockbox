@@ -635,12 +635,15 @@ func (lb *Lockbox) IngestParquet(ctx context.Context, path string, opts ...Optio
 		return fmt.Errorf("failed to create parquet reader: %w", err)
 	}
 
-	pqSchema := pqReader.Schema()
+	pqSchema, err := pqReader.Schema()
+	if err != nil {
+		return fmt.Errorf("failed to get parquet schema: %w", err)
+	}
 	if err := validateParquetSchema(lb.Schema(), pqSchema); err != nil {
 		return err
 	}
 
-	recReader, err := pqReader.GetRecordReader(ctx, nil, options.Columns)
+	recReader, err := pqReader.GetRecordReader(ctx, nil, nil)
 	if err != nil {
 		return fmt.Errorf("failed to get record reader: %w", err)
 	}

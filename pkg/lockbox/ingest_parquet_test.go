@@ -8,7 +8,6 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
-	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 )
 
@@ -19,12 +18,10 @@ func writeParquet(path string, rec arrow.Record) error {
 		return err
 	}
 	defer f.Close()
-	pw, err := file.NewParquetWriter(f, rec.Schema(), nil)
+	w, err := pqarrow.NewFileWriter(rec.Schema(), f, nil, pqarrow.ArrowWriterProperties{})
 	if err != nil {
 		return err
 	}
-	defer pw.Close()
-	w := pqarrow.NewFileWriter(pw, pqarrow.ArrowWriterProperties{}, memory.NewGoAllocator())
 	if err := w.Write(rec); err != nil {
 		return err
 	}
