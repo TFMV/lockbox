@@ -286,7 +286,7 @@ func (w *Writer) WriteRecord(record arrow.Record) error {
 	return nil
 }
 
-// ReadRecord reads and decrypts an Arrow record from the file
+// ReadRecord reads and decrypts all columns from the file
 func (r *Reader) ReadRecord() (arrow.Record, error) {
 	mem := memory.NewGoAllocator()
 
@@ -376,6 +376,101 @@ func (r *Reader) ReadRecord() (arrow.Record, error) {
 	}
 
 	// Log access
+	r.file.metadata.LogAccess("system", "read", "record", true, fmt.Sprintf("read %d rows", result.NumRows()))
+
+	return result, nil
+}
+
+// ReadColumns decrypts only the specified columns from the file
+func (r *Reader) ReadColumns(columns []string) (arrow.Record, error) {
+	mem := memory.NewGoAllocator()
+
+	colSet := make(map[string]struct{})
+	for _, c := range columns {
+		colSet[c] = struct{}{}
+	}
+
+	var arrays []arrow.Array
+	var fields []arrow.Field
+
+	schema := r.file.metadata.Schema
+
+	for i, field := range schema.Fields() {
+		if len(colSet) > 0 {
+			if _, ok := colSet[field.Name]; !ok {
+				continue
+			}
+		}
+
+		// Find block info for this column
+		var blockInfo *metadata.BlockInfo
+		for _, block := range r.file.metadata.BlockInfo {
+			if block.ColumnName == field.Name {
+				blockInfo = &block
+				break
+			}
+		}
+
+		if blockInfo == nil {
+			return nil, fmt.Errorf("no block info for column %s", field.Name)
+		}
+
+		if _, err := r.file.file.Seek(blockInfo.Offset, io.SeekStart); err != nil {
+			return nil, fmt.Errorf("failed to seek to block for column %s: %w", field.Name, err)
+		}
+
+		encryptedData := make([]byte, blockInfo.Length)
+		if _, err := io.ReadFull(r.file.file, encryptedData); err != nil {
+			return nil, fmt.Errorf("failed to read encrypted data for column %s: %w", field.Name, err)
+		}
+
+		checksum := sha256.Sum256(encryptedData)
+		if !bytes.Equal(checksum[:], blockInfo.Checksum) {
+			return nil, fmt.Errorf("checksum mismatch for column %s", field.Name)
+		}
+
+		encryptor, exists := r.encryptors[field.Name]
+		if !exists {
+			return nil, fmt.Errorf("no encryptor for column %s", field.Name)
+		}
+
+		decryptedData, err := encryptor.Decrypt(encryptedData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt column %s: %w", field.Name, err)
+		}
+
+		reader, err := ipc.NewReader(bytes.NewReader(decryptedData), ipc.WithAllocator(mem))
+		if err != nil {
+			return nil, fmt.Errorf("failed to create reader for column %s: %w", field.Name, err)
+		}
+
+		rec, err := reader.Read()
+		if err != nil {
+			reader.Release()
+			return nil, fmt.Errorf("failed to read record for column %s: %w", field.Name, err)
+		}
+
+		if rec.Column(0) == nil {
+			rec.Release()
+			reader.Release()
+			return nil, fmt.Errorf("nil column data for %s", field.Name)
+		}
+
+		col := rec.Column(0)
+		col.Retain()
+		arrays = append(arrays, col)
+		fields = append(fields, field)
+		rec.Release()
+		reader.Release()
+	}
+
+	newSchema := arrow.NewSchema(fields, nil)
+	result := array.NewRecord(newSchema, arrays, -1)
+
+	for _, col := range arrays {
+		col.Release()
+	}
+
 	r.file.metadata.LogAccess("system", "read", "record", true, fmt.Sprintf("read %d rows", result.NumRows()))
 
 	return result, nil

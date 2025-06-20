@@ -243,6 +243,7 @@ lockbox query [file] --password [password] [options]
 
 Options:
   -q, --sql string       SQL query to execute (default "SELECT * FROM data")
+      --columns string   Column projection shorthand
   -p, --password string  Password for decryption
   -o, --output string    Output format (table, json, csv) (default "table")
 ```
@@ -266,3 +267,25 @@ Options:
   -v, --verbose          Enable verbose output
       --config string    Config file (default is $HOME/.lockbox.yaml)
 ```
+
+## Advanced Queries with Lockbox
+
+Lockbox supports a subset of SQL for in-memory querying. Only columns referenced
+in the query are decrypted.
+
+Example:
+
+```bash
+lockbox query userdata.lbx --password hunter2 \
+  --sql "SELECT user_id, score FROM data WHERE score > 50 ORDER BY score DESC LIMIT 5" \
+  --output json
+```
+
+You can also use the `--columns` shorthand:
+
+```bash
+lockbox query userdata.lbx --password hunter2 --columns user_id,email
+```
+
+Supported features: `SELECT`, `WHERE`, `ORDER BY`, `LIMIT` with basic numeric
+filters and ordering.

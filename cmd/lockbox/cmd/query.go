@@ -3,9 +3,12 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"strings"
 	"syscall"
 
 	"github.com/TFMV/lockbox/pkg/lockbox"
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -22,8 +25,19 @@ from encrypted lockbox files.`,
 		filename := args[0]
 
 		sqlQuery, _ := cmd.Flags().GetString("sql")
+		columnsFlag, _ := cmd.Flags().GetString("columns")
 		password, _ := cmd.Flags().GetString("password")
 		output, _ := cmd.Flags().GetString("output")
+
+		if columnsFlag != "" {
+			cols := strings.Split(columnsFlag, ",")
+			for i, c := range cols {
+				cols[i] = strings.TrimSpace(c)
+			}
+			if sqlQuery == "" || sqlQuery == "SELECT * FROM data" {
+				sqlQuery = fmt.Sprintf("SELECT %s FROM data", strings.Join(cols, ", "))
+			}
+		}
 
 		// Get password if not provided
 		if password == "" {
@@ -70,12 +84,13 @@ func init() {
 	rootCmd.AddCommand(queryCmd)
 
 	queryCmd.Flags().StringP("sql", "q", "SELECT * FROM data", "SQL query to execute")
+	queryCmd.Flags().String("columns", "", "Column projection shorthand")
 	queryCmd.Flags().StringP("password", "p", "", "Password for decryption")
 	queryCmd.Flags().StringP("output", "o", "table", "Output format (table, json, csv)")
 }
 
-func outputTable(result *lockbox.QueryResult) error {
-	schema := result.Schema()
+func outputTable(rec arrow.Record) error {
+	schema := rec.Schema()
 
 	// Print header
 	for i, field := range schema.Fields() {
@@ -98,53 +113,42 @@ func outputTable(result *lockbox.QueryResult) error {
 	fmt.Println()
 
 	// Print data rows
-	for result.Next() {
-		record := result.Record()
-		if record != nil {
-			for i := int64(0); i < record.NumRows(); i++ {
-				for j, col := range record.Columns() {
-					if j > 0 {
-						fmt.Print("\t")
-					}
-
-					// Simple value extraction - in a full implementation
-					// this would handle all Arrow types properly
-					switch col := col.(type) {
-					default:
-						fmt.Printf("%v", col)
-					}
-				}
-				fmt.Println()
+	for i := int64(0); i < rec.NumRows(); i++ {
+		for j, col := range rec.Columns() {
+			if j > 0 {
+				fmt.Print("\t")
 			}
+			fmt.Printf("%v", getValue(col, int(i)))
 		}
+		fmt.Println()
 	}
 
 	return nil
 }
 
-func outputJSON(result *lockbox.QueryResult) error {
-	fmt.Println("{")
-	fmt.Printf("  \"schema\": %v,\n", result.Schema())
-	fmt.Println("  \"data\": [")
-
-	first := true
-	for result.Next() {
-		if !first {
-			fmt.Println(",")
+func outputJSON(rec arrow.Record) error {
+	schema := rec.Schema()
+	fmt.Print("[")
+	for i := int64(0); i < rec.NumRows(); i++ {
+		if i > 0 {
+			fmt.Print(",")
 		}
-		fmt.Print("    {}")
-		first = false
+		fmt.Print("{")
+		for j, col := range rec.Columns() {
+			if j > 0 {
+				fmt.Print(",")
+			}
+			fmt.Printf("\"%s\":\"%v\"", schema.Field(j).Name, getValue(col, int(i)))
+		}
+		fmt.Print("}")
 	}
-
-	fmt.Println()
-	fmt.Println("  ]")
-	fmt.Println("}")
+	fmt.Println("]")
 
 	return nil
 }
 
-func outputCSV(result *lockbox.QueryResult) error {
-	schema := result.Schema()
+func outputCSV(rec arrow.Record) error {
+	schema := rec.Schema()
 
 	// Print header
 	for i, field := range schema.Fields() {
@@ -156,20 +160,28 @@ func outputCSV(result *lockbox.QueryResult) error {
 	fmt.Println()
 
 	// Print data - simplified for MVP
-	for result.Next() {
-		record := result.Record()
-		if record != nil {
-			for i := int64(0); i < record.NumRows(); i++ {
-				for j := range record.Columns() {
-					if j > 0 {
-						fmt.Print(",")
-					}
-					fmt.Print("value") // Simplified for MVP
-				}
-				fmt.Println()
+	for i := int64(0); i < rec.NumRows(); i++ {
+		for j, col := range rec.Columns() {
+			if j > 0 {
+				fmt.Print(",")
 			}
+			fmt.Printf("%v", getValue(col, int(i)))
 		}
+		fmt.Println()
 	}
 
 	return nil
+}
+
+func getValue(col arrow.Array, row int) interface{} {
+	switch c := col.(type) {
+	case *array.Int64:
+		return c.Value(row)
+	case *array.Float64:
+		return c.Value(row)
+	case *array.String:
+		return c.Value(row)
+	default:
+		return nil
+	}
 }

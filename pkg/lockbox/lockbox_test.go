@@ -182,3 +182,69 @@ func TestInfo(t *testing.T) {
 
 	t.Logf("Info test passed: created by %s, %d fields", info.CreatedBy, len(info.Schema.Fields()))
 }
+
+func TestQuery(t *testing.T) {
+	schema := arrow.NewSchema([]arrow.Field{
+		{Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
+		{Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
+		{Name: "score", Type: arrow.PrimitiveTypes.Float64, Nullable: true},
+	}, nil)
+
+	tmpFile := "/tmp/test_lockbox_query.lbx"
+	defer os.Remove(tmpFile)
+
+	password := "test_password_123"
+
+	lb, err := Create(tmpFile, schema, WithPassword(password), WithCreatedBy("tester"))
+	if err != nil {
+		t.Fatalf("Failed to create lockbox: %v", err)
+	}
+
+	mem := memory.NewGoAllocator()
+	idb := array.NewInt64Builder(mem)
+	nameb := array.NewStringBuilder(mem)
+	scoreb := array.NewFloat64Builder(mem)
+
+	idb.AppendValues([]int64{1, 2, 3}, nil)
+	nameb.AppendValues([]string{"alice", "bob", "carol"}, nil)
+	scoreb.AppendValues([]float64{10, 55, 30}, nil)
+
+	idArr := idb.NewArray()
+	nameArr := nameb.NewArray()
+	scoreArr := scoreb.NewArray()
+	record := array.NewRecord(schema, []arrow.Array{idArr, nameArr, scoreArr}, 3)
+
+	ctx := context.Background()
+	if err := lb.Write(ctx, record, WithPassword(password)); err != nil {
+		t.Fatalf("write error: %v", err)
+	}
+	record.Release()
+	idArr.Release()
+	nameArr.Release()
+	scoreArr.Release()
+	idb.Release()
+	nameb.Release()
+	scoreb.Release()
+	lb.Close()
+
+	lb2, err := Open(tmpFile, WithPassword(password))
+	if err != nil {
+		t.Fatalf("open error: %v", err)
+	}
+	defer lb2.Close()
+
+	res, err := lb2.Query(ctx, "SELECT name, score FROM data WHERE score > 20 ORDER BY score DESC LIMIT 1", WithPassword(password))
+	if err != nil {
+		t.Fatalf("query error: %v", err)
+	}
+	defer res.Release()
+
+	if res.NumRows() != 1 {
+		t.Fatalf("expected 1 row, got %d", res.NumRows())
+	}
+
+	nameCol := res.Column(0).(*array.String)
+	if nameCol.Value(0) != "bob" {
+		t.Fatalf("unexpected name: %s", nameCol.Value(0))
+	}
+}
