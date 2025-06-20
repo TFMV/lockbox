@@ -1,0 +1,6 @@
+user_id,username,email,created_at,score
+1,alice,alice@example.com,2024-06-21T10:10:10Z,98.6
+2,bob,,2024-06-20T08:22:35Z,
+3,charlie,charlie@example.com,2024-06-18T12:30:45Z,76.2
+4,david,david@domain.com,2024-06-10T19:11:09Z,85.5
+5,ellen,ellen@work.com,2024-06-19T05:05:05Z,
