@@ -3,10 +3,15 @@ package lockbox
 import (
 	"context"
 	"fmt"
+	"sort"
+	"strconv"
+	"strings"
 
 	"github.com/TFMV/lockbox/pkg/crypto"
 	"github.com/TFMV/lockbox/pkg/format"
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/rs/zerolog/log"
 )
 
@@ -251,7 +256,8 @@ func (lb *Lockbox) Read(ctx context.Context, opts ...Option) (arrow.Record, erro
 
 // Query performs a simple query on the lockbox data
 // This is a basic implementation that reads all data and applies simple filters
-func (lb *Lockbox) Query(ctx context.Context, query string, opts ...Option) (*QueryResult, error) {
+// query-engine
+func (lb *Lockbox) Query(ctx context.Context, query string, opts ...Option) (arrow.Record, error) {
 	options := &Options{
 		Password: "",
 		Columns:  []string{},
@@ -265,59 +271,298 @@ func (lb *Lockbox) Query(ctx context.Context, query string, opts ...Option) (*Qu
 		return nil, fmt.Errorf("password is required for querying")
 	}
 
-	// For MVP, we'll implement a very basic query parser
-	// In a full implementation, this would be much more sophisticated
-	record, err := lb.Read(ctx, WithPassword(options.Password))
+	pq, err := parseQuery(query)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read data for query: %w", err)
+		return nil, err
 	}
 
-	// Create query result
-	result := &QueryResult{
-		record: record,
-		schema: record.Schema(),
+	// Determine required columns
+	required := append([]string{}, pq.SelectCols...)
+	if pq.WhereCol != "" {
+		if !contains(required, pq.WhereCol) {
+			required = append(required, pq.WhereCol)
+		}
+	}
+	if pq.OrderCol != "" {
+		if !contains(required, pq.OrderCol) {
+			required = append(required, pq.OrderCol)
+		}
 	}
 
-	log.Debug().
-		Str("query", query).
-		Int64("rows", record.NumRows()).
-		Msg("Executed query on lockbox")
+	reader, err := lb.file.NewReader(options.Password)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create reader: %w", err)
+	}
+
+	rec, err := reader.ReadColumns(required)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read data: %w", err)
+	}
+
+	result, err := applyQuery(rec, pq)
+	if err != nil {
+		rec.Release()
+		return nil, err
+	}
+	rec.Release()
+
+	log.Debug().Str("query", query).Int64("rows", result.NumRows()).Msg("Executed query on lockbox")
 
 	return result, nil
 }
 
-// QueryResult represents the result of a query operation
-type QueryResult struct {
-	record arrow.Record
-	schema *arrow.Schema
-	pos    int
+type parsedQuery struct {
+	SelectCols []string
+	WhereCol   string
+	WhereOp    string
+	WhereVal   string
+	OrderCol   string
+	OrderDesc  bool
+	Limit      int
 }
 
-// Next advances to the next row in the result set
-func (qr *QueryResult) Next() bool {
-	return qr.pos < int(qr.record.NumRows())
-}
+func parseQuery(q string) (*parsedQuery, error) {
+	pq := &parsedQuery{Limit: -1}
 
-// Record returns the current Arrow record
-func (qr *QueryResult) Record() arrow.Record {
-	if qr.pos < int(qr.record.NumRows()) {
-		qr.pos++
-		return qr.record
+	upper := strings.ToUpper(q)
+	parts := strings.Fields(upper)
+	if len(parts) < 4 || parts[0] != "SELECT" {
+		return nil, fmt.Errorf("invalid query")
 	}
-	return nil
-}
 
-// Schema returns the schema of the query result
-func (qr *QueryResult) Schema() *arrow.Schema {
-	return qr.schema
-}
-
-// Release releases the resources associated with the query result
-func (qr *QueryResult) Release() {
-	if qr.record != nil {
-		qr.record.Release()
-		qr.record = nil
+	fromIdx := -1
+	for i, p := range parts {
+		if p == "FROM" {
+			fromIdx = i
+			break
+		}
 	}
+	if fromIdx == -1 || fromIdx == 1 {
+		return nil, fmt.Errorf("invalid query")
+	}
+
+	selectRaw := strings.Join(parts[1:fromIdx], " ")
+	cols := strings.Split(selectRaw, ",")
+	for i := range cols {
+		c := strings.TrimSpace(cols[i])
+		if c != "*" && c != "" {
+			pq.SelectCols = append(pq.SelectCols, strings.ToLower(c))
+		}
+	}
+
+	i := fromIdx + 2 // skip FROM data
+	for i < len(parts) {
+		switch parts[i] {
+		case "WHERE":
+			if i+3 >= len(parts) {
+				return nil, fmt.Errorf("invalid WHERE clause")
+			}
+			pq.WhereCol = strings.ToLower(parts[i+1])
+			pq.WhereOp = parts[i+2]
+			pq.WhereVal = parts[i+3]
+			i += 4
+		case "ORDER":
+			if i+3 >= len(parts) || parts[i+1] != "BY" {
+				return nil, fmt.Errorf("invalid ORDER BY clause")
+			}
+			pq.OrderCol = strings.ToLower(parts[i+2])
+			if i+3 < len(parts) && (parts[i+3] == "DESC" || parts[i+3] == "ASC") {
+				pq.OrderDesc = parts[i+3] == "DESC"
+				i += 4
+			} else {
+				i += 3
+			}
+		case "LIMIT":
+			if i+1 >= len(parts) {
+				return nil, fmt.Errorf("invalid LIMIT clause")
+			}
+			val, err := strconv.Atoi(parts[i+1])
+			if err != nil {
+				return nil, fmt.Errorf("invalid LIMIT value")
+			}
+			pq.Limit = val
+			i += 2
+		default:
+			i++
+		}
+	}
+
+	return pq, nil
+}
+
+func applyQuery(rec arrow.Record, pq *parsedQuery) (arrow.Record, error) {
+	mem := memory.NewGoAllocator()
+
+	rowCount := int(rec.NumRows())
+	idx := make([]int, rowCount)
+	for i := range idx {
+		idx[i] = i
+	}
+
+	// WHERE filtering
+	if pq.WhereCol != "" {
+		col := rec.Column(rec.Schema().FieldIndices(pq.WhereCol)[0])
+		var keep []int
+		for _, i := range idx {
+			if matchValue(col, i, pq.WhereOp, pq.WhereVal) {
+				keep = append(keep, i)
+			}
+		}
+		idx = keep
+	}
+
+	// ORDER BY
+	if pq.OrderCol != "" {
+		col := rec.Column(rec.Schema().FieldIndices(pq.OrderCol)[0])
+		sort.Slice(idx, func(a, b int) bool {
+			va := getValue(col, idx[a])
+			vb := getValue(col, idx[b])
+			if pq.OrderDesc {
+				return less(vb, va)
+			}
+			return less(va, vb)
+		})
+	}
+
+	// LIMIT
+	if pq.Limit >= 0 && pq.Limit < len(idx) {
+		idx = idx[:pq.Limit]
+	}
+
+	// Build result
+	if len(pq.SelectCols) == 0 {
+		for _, f := range rec.Schema().Fields() {
+			pq.SelectCols = append(pq.SelectCols, f.Name)
+		}
+	}
+
+	builders := make([]array.Builder, len(pq.SelectCols))
+	fields := make([]arrow.Field, len(pq.SelectCols))
+
+	for i, name := range pq.SelectCols {
+		fIdx := rec.Schema().FieldIndices(name)[0]
+		field := rec.Schema().Field(fIdx)
+		fields[i] = field
+		switch field.Type.ID() {
+		case arrow.INT64:
+			builders[i] = array.NewInt64Builder(mem)
+		case arrow.FLOAT64:
+			builders[i] = array.NewFloat64Builder(mem)
+		default:
+			builders[i] = array.NewStringBuilder(mem)
+		}
+	}
+
+	for _, row := range idx {
+		for i, name := range pq.SelectCols {
+			fIdx := rec.Schema().FieldIndices(name)[0]
+			col := rec.Column(fIdx)
+			appendValue(builders[i], col, row)
+		}
+	}
+
+	arrays := make([]arrow.Array, len(builders))
+	for i, b := range builders {
+		arrays[i] = b.NewArray()
+		b.Release()
+	}
+
+	schema := arrow.NewSchema(fields, nil)
+	return array.NewRecord(schema, arrays, int64(len(idx))), nil
+}
+
+func matchValue(col arrow.Array, row int, op, val string) bool {
+	cv := getValue(col, row)
+	fVal, ferr := strconv.ParseFloat(val, 64)
+	switch v := cv.(type) {
+	case int64:
+		if ferr != nil {
+			return false
+		}
+		switch op {
+		case ">":
+			return float64(v) > fVal
+		case "<":
+			return float64(v) < fVal
+		case "=":
+			return float64(v) == fVal
+		case ">=":
+			return float64(v) >= fVal
+		case "<=":
+			return float64(v) <= fVal
+		}
+	case float64:
+		if ferr != nil {
+			return false
+		}
+		switch op {
+		case ">":
+			return v > fVal
+		case "<":
+			return v < fVal
+		case "=":
+			return v == fVal
+		case ">=":
+			return v >= fVal
+		case "<=":
+			return v <= fVal
+		}
+	case string:
+		switch op {
+		case "=":
+			return v == strings.Trim(val, "'\"")
+		}
+	}
+	return false
+}
+
+func getValue(col arrow.Array, row int) interface{} {
+	switch c := col.(type) {
+	case *array.Int64:
+		return c.Value(row)
+	case *array.Float64:
+		return c.Value(row)
+	case *array.String:
+		return c.Value(row)
+	default:
+		return nil
+	}
+}
+
+func appendValue(b array.Builder, col arrow.Array, row int) {
+	switch c := col.(type) {
+	case *array.Int64:
+		builder := b.(*array.Int64Builder)
+		builder.Append(c.Value(row))
+	case *array.Float64:
+		builder := b.(*array.Float64Builder)
+		builder.Append(c.Value(row))
+	case *array.String:
+		builder := b.(*array.StringBuilder)
+		builder.Append(c.Value(row))
+	}
+}
+
+func less(a, b interface{}) bool {
+	switch av := a.(type) {
+	case int64:
+		return av < b.(int64)
+	case float64:
+		return av < b.(float64)
+	case string:
+		return av < b.(string)
+	default:
+		return false
+	}
+}
+
+func contains(list []string, v string) bool {
+	for _, s := range list {
+		if s == v {
+			return true
+		}
+	}
+	return false
 }
 
 // Info returns information about the lockbox file
