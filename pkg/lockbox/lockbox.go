@@ -3,9 +3,13 @@ package lockbox
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/apache/arrow-go/v18/parquet/file"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 
 	"github.com/TFMV/lockbox/pkg/crypto"
 	"github.com/TFMV/lockbox/pkg/format"
@@ -28,6 +32,7 @@ type Options struct {
 	Password  string
 	CreatedBy string
 	Columns   []string
+	DryRun    bool
 }
 
 // Option is a functional option for lockbox operations
@@ -51,6 +56,13 @@ func WithCreatedBy(createdBy string) Option {
 func WithColumns(columns ...string) Option {
 	return func(o *Options) {
 		o.Columns = columns
+	}
+}
+
+// WithDryRun enables or disables dry-run mode
+func WithDryRun(v bool) Option {
+	return func(o *Options) {
+		o.DryRun = v
 	}
 }
 
@@ -591,4 +603,139 @@ type Info struct {
 	ModifiedBy  string        `json:"modifiedBy"`
 	BlockCount  int           `json:"blockCount"`
 	AccessCount int           `json:"accessCount"`
+}
+
+// IngestParquet ingests a Parquet file into the lockbox
+func (lb *Lockbox) IngestParquet(ctx context.Context, path string, opts ...Option) error {
+	options := &Options{Password: "", Columns: []string{}, DryRun: false}
+	for _, opt := range opts {
+		opt(options)
+	}
+
+	if options.Password == "" {
+		return fmt.Errorf("password is required for ingestion")
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("failed to open parquet file: %w", err)
+	}
+	defer f.Close()
+
+	mem := memory.NewGoAllocator()
+
+	pf, err := file.NewParquetReader(f)
+	if err != nil {
+		return fmt.Errorf("failed to read parquet file: %w", err)
+	}
+	defer pf.Close()
+
+	pqReader, err := pqarrow.NewFileReader(pf, pqarrow.ArrowReadProperties{BatchSize: 1024}, mem)
+	if err != nil {
+		return fmt.Errorf("failed to create parquet reader: %w", err)
+	}
+
+	pqSchema := pqReader.Schema()
+	if err := validateParquetSchema(lb.Schema(), pqSchema); err != nil {
+		return err
+	}
+
+	recReader, err := pqReader.GetRecordReader(ctx, nil, options.Columns)
+	if err != nil {
+		return fmt.Errorf("failed to get record reader: %w", err)
+	}
+	defer recReader.Release()
+
+	var totalRows int64
+	for recReader.Next() {
+		rec := recReader.Record()
+		coerced, err := coerceRecord(lb.Schema(), rec)
+		if err != nil {
+			rec.Release()
+			return err
+		}
+
+		if !options.DryRun {
+			if err := lb.Write(ctx, coerced, WithPassword(options.Password)); err != nil {
+				coerced.Release()
+				rec.Release()
+				return err
+			}
+		}
+		totalRows += coerced.NumRows()
+		coerced.Release()
+		rec.Release()
+	}
+
+	log.Info().Str("file", path).Int64("rows", totalRows).Bool("dry_run", options.DryRun).Msg("Ingested parquet")
+	return nil
+}
+
+// validateParquetSchema ensures the parquet schema matches or is a superset of the lockbox schema
+func validateParquetSchema(lb *arrow.Schema, pq *arrow.Schema) error {
+	for i, field := range lb.Fields() {
+		if i >= len(pq.Fields()) {
+			return fmt.Errorf("parquet missing field %s", field.Name)
+		}
+
+		pqField := pq.Field(i)
+		if field.Name != pqField.Name {
+			return fmt.Errorf("field name mismatch at index %d: %s vs %s", i, field.Name, pqField.Name)
+		}
+
+		if !typesCompatible(field.Type, pqField.Type) {
+			return fmt.Errorf("incompatible type for field %s", field.Name)
+		}
+	}
+	return nil
+}
+
+// typesCompatible checks if parquet type can be coerced into lockbox type
+func typesCompatible(dst, src arrow.DataType) bool {
+	if arrow.TypeEqual(dst, src) {
+		return true
+	}
+	if dst.ID() == arrow.INT64 && src.ID() == arrow.INT32 {
+		return true
+	}
+	return false
+}
+
+// coerceRecord converts parquet record columns to lockbox schema order and types
+func coerceRecord(schema *arrow.Schema, rec arrow.Record) (arrow.Record, error) {
+	if rec.Schema().Equal(schema) {
+		rec.Retain()
+		return rec, nil
+	}
+
+	mem := memory.NewGoAllocator()
+	var cols []arrow.Array
+	for i, field := range schema.Fields() {
+		src := rec.Column(i)
+		if !arrow.TypeEqual(field.Type, src.DataType()) {
+			if field.Type.ID() == arrow.INT64 && src.DataType().ID() == arrow.INT32 {
+				b := array.NewInt64Builder(mem)
+				int32Arr := src.(*array.Int32)
+				for j := 0; j < int(int32Arr.Len()); j++ {
+					if int32Arr.IsNull(j) {
+						b.AppendNull()
+					} else {
+						b.Append(int64(int32Arr.Value(j)))
+					}
+				}
+				cols = append(cols, b.NewArray())
+				b.Release()
+			} else {
+				return nil, fmt.Errorf("cannot coerce column %s", field.Name)
+			}
+		} else {
+			src.Retain()
+			cols = append(cols, src)
+		}
+	}
+	out := array.NewRecord(schema, cols, rec.NumRows())
+	for _, c := range cols {
+		c.Release()
+	}
+	return out, nil
 }
