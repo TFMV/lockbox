@@ -8,6 +8,11 @@
 *.so
 *.dylib
 
+
+*.lbx
+*.out
+lockbox
+
 # Test binary, built with `go test -c`
 *.test
 
@@ -30,3 +35,7 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+
+lockbox
+lockbox

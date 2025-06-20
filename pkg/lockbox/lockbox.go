@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/apache/arrow-go/v18/parquet/file"
 	"github.com/apache/arrow-go/v18/parquet/pqarrow"
@@ -460,7 +461,12 @@ func applyQuery(rec arrow.Record, pq *parsedQuery) (arrow.Record, error) {
 			builders[i] = array.NewInt64Builder(mem)
 		case arrow.FLOAT64:
 			builders[i] = array.NewFloat64Builder(mem)
+		case arrow.STRING:
+			builders[i] = array.NewStringBuilder(mem)
+		case arrow.TIMESTAMP:
+			builders[i] = array.NewTimestampBuilder(mem, field.Type.(*arrow.TimestampType))
 		default:
+			// fallback to string, or handle more types as needed
 			builders[i] = array.NewStringBuilder(mem)
 		}
 	}
@@ -529,29 +535,48 @@ func matchValue(col arrow.Array, row int, op, val string) bool {
 }
 
 func getValue(col arrow.Array, row int) interface{} {
+	if col.IsNull(row) {
+		return "NULL"
+	}
 	switch c := col.(type) {
 	case *array.Int64:
-		return c.Value(row)
+		val := c.Value(row)
+		return val
 	case *array.Float64:
-		return c.Value(row)
+		val := c.Value(row)
+		return val
 	case *array.String:
-		return c.Value(row)
+		val := c.Value(row)
+		return val
+	case *array.Timestamp:
+		ts := c.Value(row)
+		switch typ := c.DataType().(*arrow.TimestampType); typ.Unit {
+		case arrow.Second:
+			return time.Unix(int64(ts), 0).UTC().Format(time.RFC3339)
+		case arrow.Millisecond:
+			return time.UnixMilli(int64(ts)).UTC().Format(time.RFC3339)
+		case arrow.Microsecond:
+			return time.UnixMicro(int64(ts)).UTC().Format(time.RFC3339)
+		case arrow.Nanosecond:
+			return time.Unix(0, int64(ts)).UTC().Format(time.RFC3339)
+		default:
+			return ts
+		}
 	default:
-		return nil
+		return "NULL"
 	}
 }
 
 func appendValue(b array.Builder, col arrow.Array, row int) {
 	switch c := col.(type) {
 	case *array.Int64:
-		builder := b.(*array.Int64Builder)
-		builder.Append(c.Value(row))
+		b.(*array.Int64Builder).Append(c.Value(row))
 	case *array.Float64:
-		builder := b.(*array.Float64Builder)
-		builder.Append(c.Value(row))
+		b.(*array.Float64Builder).Append(c.Value(row))
 	case *array.String:
-		builder := b.(*array.StringBuilder)
-		builder.Append(c.Value(row))
+		b.(*array.StringBuilder).Append(c.Value(row))
+	case *array.Timestamp:
+		b.(*array.TimestampBuilder).Append(c.Value(row))
 	}
 }
 

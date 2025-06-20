@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/TFMV/lockbox/pkg/lockbox"
 	"github.com/apache/arrow-go/v18/arrow"
@@ -118,13 +119,50 @@ func outputTable(rec arrow.Record) error {
 			if j > 0 {
 				fmt.Print("\t")
 			}
-			fmt.Printf("%v", getValue(col, int(i)))
+			fmt.Printf("%v", getValue(col, int(i))) // ⬅️ THIS LINE is mandatory!
 		}
 		fmt.Println()
 	}
 
 	return nil
 }
+
+// func outputTable(rec arrow.Record) error {
+// 	schema := rec.Schema()
+
+// 	// Print header
+// 	for i, field := range schema.Fields() {
+// 		if i > 0 {
+// 			fmt.Print("\t")
+// 		}
+// 		fmt.Print(field.Name)
+// 	}
+// 	fmt.Println()
+
+// 	// Print separator
+// 	for i, field := range schema.Fields() {
+// 		if i > 0 {
+// 			fmt.Print("\t")
+// 		}
+// 		for range len(field.Name) {
+// 			fmt.Print("-")
+// 		}
+// 	}
+// 	fmt.Println()
+
+// 	// Print data rows
+// 	for i := int64(0); i < rec.NumRows(); i++ {
+// 		for j, col := range rec.Columns() {
+// 			if j > 0 {
+// 				fmt.Print("\t")
+// 			}
+// 			fmt.Printf("%v", getValue(col, int(i)))
+// 		}
+// 		fmt.Println()
+// 	}
+
+// 	return nil
+// }
 
 func outputJSON(rec arrow.Record) error {
 	schema := rec.Schema()
@@ -174,14 +212,34 @@ func outputCSV(rec arrow.Record) error {
 }
 
 func getValue(col arrow.Array, row int) interface{} {
+	if col.IsNull(row) {
+		return "NULL"
+	}
 	switch c := col.(type) {
 	case *array.Int64:
-		return c.Value(row)
+		val := c.Value(row)
+		return val
 	case *array.Float64:
-		return c.Value(row)
+		val := c.Value(row)
+		return val
 	case *array.String:
-		return c.Value(row)
+		val := c.Value(row)
+		return val
+	case *array.Timestamp:
+		ts := c.Value(row)
+		switch typ := c.DataType().(*arrow.TimestampType); typ.Unit {
+		case arrow.Second:
+			return time.Unix(int64(ts), 0).UTC().Format(time.RFC3339)
+		case arrow.Millisecond:
+			return time.UnixMilli(int64(ts)).UTC().Format(time.RFC3339)
+		case arrow.Microsecond:
+			return time.UnixMicro(int64(ts)).UTC().Format(time.RFC3339)
+		case arrow.Nanosecond:
+			return time.Unix(0, int64(ts)).UTC().Format(time.RFC3339)
+		default:
+			return ts
+		}
 	default:
-		return nil
+		return "NULL"
 	}
 }
