@@ -30,10 +30,11 @@ type Lockbox struct {
 
 // Options for lockbox operations
 type Options struct {
-	Password  string
-	CreatedBy string
-	Columns   []string
-	DryRun    bool
+	Password     string
+	CreatedBy    string
+	Columns      []string
+	DryRun       bool
+	CryptoModule string
 }
 
 // Option is a functional option for lockbox operations
@@ -67,12 +68,20 @@ func WithDryRun(v bool) Option {
 	}
 }
 
+// WithCryptoModule selects the cryptographic module by name.
+func WithCryptoModule(name string) Option {
+	return func(o *Options) {
+		o.CryptoModule = name
+	}
+}
+
 // Create creates a new lockbox file with the given schema
 func Create(filename string, schema *arrow.Schema, opts ...Option) (*Lockbox, error) {
 	options := &Options{
-		Password:  "",
-		CreatedBy: "system",
-		Columns:   []string{},
+		Password:     "",
+		CreatedBy:    "system",
+		Columns:      []string{},
+		CryptoModule: "",
 	}
 
 	for _, opt := range opts {
@@ -83,13 +92,18 @@ func Create(filename string, schema *arrow.Schema, opts ...Option) (*Lockbox, er
 		return nil, fmt.Errorf("password is required")
 	}
 
+	module, ok := crypto.GetModule(options.CryptoModule)
+	if !ok {
+		module, _ = crypto.GetModule("default")
+	}
+
 	// Generate key with post-quantum components
-	key, err := crypto.NewKey(options.Password)
+	key, err := module.NewKey(options.Password)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate key: %w", err)
 	}
 
-	file, err := format.Create(filename, schema, options.Password, options.CreatedBy)
+	file, err := format.Create(filename, schema, options.Password, options.CreatedBy, module)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create lockbox file: %w", err)
 	}
@@ -111,9 +125,10 @@ func Create(filename string, schema *arrow.Schema, opts ...Option) (*Lockbox, er
 // Open opens an existing lockbox file
 func Open(filename string, opts ...Option) (*Lockbox, error) {
 	options := &Options{
-		Password:  "",
-		CreatedBy: "system",
-		Columns:   []string{},
+		Password:     "",
+		CreatedBy:    "system",
+		Columns:      []string{},
+		CryptoModule: "",
 	}
 
 	for _, opt := range opts {
@@ -124,10 +139,15 @@ func Open(filename string, opts ...Option) (*Lockbox, error) {
 		return nil, fmt.Errorf("password is required")
 	}
 
-	// Derive key with post-quantum components if available
-	key := crypto.DeriveKey(options.Password, nil) // Salt will be read from file
+	module, ok := crypto.GetModule(options.CryptoModule)
+	if !ok {
+		module, _ = crypto.GetModule("default")
+	}
 
-	file, err := format.Open(filename, options.Password)
+	// Derive key with post-quantum components if available
+	key := module.DeriveKey(options.Password, nil) // Salt will be read from file
+
+	file, err := format.Open(filename, options.Password, module)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open lockbox file: %w", err)
 	}
@@ -170,8 +190,9 @@ func (lb *Lockbox) Schema() *arrow.Schema {
 // Write writes an Arrow record to the lockbox
 func (lb *Lockbox) Write(ctx context.Context, record arrow.Record, opts ...Option) error {
 	options := &Options{
-		Password: "",
-		Columns:  []string{},
+		Password:     "",
+		Columns:      []string{},
+		CryptoModule: "",
 	}
 
 	for _, opt := range opts {
@@ -241,8 +262,9 @@ func (lb *Lockbox) WriteAsync(ctx context.Context, record arrow.Record, opts ...
 // Read reads an Arrow record from the lockbox
 func (lb *Lockbox) Read(ctx context.Context, opts ...Option) (arrow.Record, error) {
 	options := &Options{
-		Password: "",
-		Columns:  []string{},
+		Password:     "",
+		Columns:      []string{},
+		CryptoModule: "",
 	}
 
 	for _, opt := range opts {
@@ -299,8 +321,9 @@ func (lb *Lockbox) ReadAsync(ctx context.Context, opts ...Option) (<-chan arrow.
 // query-engine
 func (lb *Lockbox) Query(ctx context.Context, query string, opts ...Option) (arrow.Record, error) {
 	options := &Options{
-		Password: "",
-		Columns:  []string{},
+		Password:     "",
+		Columns:      []string{},
+		CryptoModule: "",
 	}
 
 	for _, opt := range opts {
@@ -669,7 +692,7 @@ type Info struct {
 
 // IngestParquet ingests a Parquet file into the lockbox
 func (lb *Lockbox) IngestParquet(ctx context.Context, path string, opts ...Option) error {
-	options := &Options{Password: "", Columns: []string{}, DryRun: false}
+	options := &Options{Password: "", Columns: []string{}, DryRun: false, CryptoModule: ""}
 	for _, opt := range opts {
 		opt(options)
 	}
