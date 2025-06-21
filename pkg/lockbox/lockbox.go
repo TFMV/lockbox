@@ -941,7 +941,7 @@ func (lb *Lockbox) IngestParquet(ctx context.Context, path string, opts ...Optio
 	var totalRows int64
 	for recReader.Next() {
 		rec := recReader.Record()
-		coerced, err := coerceRecord(lb.Schema(), rec)
+		coerced, err := CoerceRecord(lb.Schema(), rec)
 		if err != nil {
 			rec.Release()
 			return err
@@ -1002,8 +1002,8 @@ func typesCompatible(dst, src arrow.DataType) bool {
 	return false
 }
 
-// coerceRecord converts parquet record columns to lockbox schema order and types
-func coerceRecord(schema *arrow.Schema, rec arrow.Record) (arrow.Record, error) {
+// CoerceRecord converts parquet record columns to lockbox schema order and types
+func CoerceRecord(schema *arrow.Schema, rec arrow.Record) (arrow.Record, error) {
 	if rec.Schema().Equal(schema) {
 		rec.Retain()
 		return rec, nil

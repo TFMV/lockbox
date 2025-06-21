@@ -7,11 +7,14 @@
 *.dll
 *.so
 *.dylib
+!*.py
+!cmd/lockbox/cmd/
+!cmd/lockbox/cmd/**
+
 
 
 *.lbx
 *.out
-lockbox
 
 # Test binary, built with `go test -c`
 *.test
