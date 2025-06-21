@@ -1,151 +1,19 @@
 # Lockbox
 
-**Secure, high-performance columnar data storage with Apache Arrow and Post-Quantum Cryptography**
+Lockbox combines the speed of Apache Arrow with transparent encryption so you can store columnar data securely on disk. It is written in Go and exposes both a command line interface and a Go SDK.
 
-Lockbox is a secure data storage system that combines Apache Arrow's zero-copy columnar data structures with enterprise-grade encryption and post-quantum cryptographic protection. It provides developers with a "fast data, under lock and key" paradigm that doesn't compromise on performance, security, or developer experience.
+## Key Features
 
-## Features
+- **Arrow Based Storage** – Records are stored as Arrow IPC blocks for fast columnar access.
+- **Hybrid Encryption** – Each column is encrypted with AES‑256‑GCM. A Kyber key pair is used to add post‑quantum protection.
+- **Extensible Crypto Modules** – Additional encryption schemes can be plugged in via Go plugins.
+- **Audit Friendly Metadata** – File metadata tracks creation details, access events and block checksums.
+- **CLI and Go SDK** – Create, write, query and inspect `.lbx` files from the terminal or directly from Go.
+- **Parquet Ingestion** – Library helpers allow importing Parquet files into a lockbox.
 
-### 🔐 MVP Features (v0.1)
+## The `.lbx` Format
 
-- **Arrow I/O**: Read/write Arrow IPC and Feather formats with full type support
-- **Hybrid Encryption**: AES-256-GCM + Kyber post-quantum encryption with individual column keys
-- **Quantum-Resistant Signatures**: Schnorr signatures based on the Kyber lattice-based suite
-- **Password-Based Authentication**: PBKDF2 key derivation with configurable iterations
-- **CLI Interface**: Complete command-line tools for common operations
-- **Go SDK**: Programmatic API for Go applications
-- **Metadata Management**: Comprehensive schema and encryption metadata storage
-- **Audit Trail**: Basic access logging and file metadata tracking
-
-### 🚀 Core Value Proposition
-
-- **Performance**: Zero-copy Arrow operations with selective decryption
-- **Security**: Hybrid classical + post-quantum encryption with fine-grained access controls
-- **Quantum Resistance**: Protection against both classical and quantum computing attacks
-- **Ergonomics**: Simple CLI and Go SDK with intuitive APIs
-- **Local-First**: Operates without cloud dependencies
-- **Extensible**: Platform for secure query patterns and data workflows
-
-## Quick Start
-
-### Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/TFMV/lockbox
-cd lockbox
-
-# Build the CLI
-go build ./cmd/lockbox
-
-# Run tests
-go test ./pkg/lockbox -v
-```
-
-### Basic Usage
-
-```bash
-# Create a new lockbox with default schema
-./lockbox create mydata.lbx --password mypassword123
-
-# View file information
-./lockbox info mydata.lbx --password mypassword123
-
-# Write sample data
-./lockbox write mydata.lbx --sample --password mypassword123
-
-# Query data (basic implementation)
-./lockbox query mydata.lbx --password mypassword123
-```
-
-### Using Custom Schema
-
-Create a schema file (`schema.json`):
-
-```json
-{
-  "fields": [
-    {"name": "user_id", "type": "int64", "nullable": false},
-    {"name": "username", "type": "string", "nullable": false},
-    {"name": "email", "type": "string", "nullable": true},
-    {"name": "created_at", "type": "timestamp", "nullable": false},
-    {"name": "score", "type": "float64", "nullable": true}
-  ]
-}
-```
-
-```bash
-# Create lockbox with custom schema
-./lockbox create userdata.lbx --schema schema.json --password mypassword123
-```
-
-## Go SDK Usage
-
-```go
-package main
-
-import (
-    "context"
-    "log"
-
-    "github.com/TFMV/lockbox/pkg/lockbox"
-    "github.com/apache/arrow-go/v18/arrow"
-    "github.com/apache/arrow-go/v18/arrow/array"
-    "github.com/apache/arrow-go/v18/arrow/memory"
-)
-
-func main() {
-    // Define schema
-    schema := arrow.NewSchema([]arrow.Field{
-        {Name: "id", Type: arrow.PrimitiveTypes.Int64, Nullable: false},
-        {Name: "name", Type: arrow.BinaryTypes.String, Nullable: true},
-    }, nil)
-
-    // Create lockbox
-    lb, err := lockbox.Create(
-        "data.lbx",
-        schema,
-        lockbox.WithPassword("mypassword123"),
-        lockbox.WithCreatedBy("myapp"),
-    )
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer lb.Close()
-
-    // Create sample data
-    mem := memory.NewGoAllocator()
-    idBuilder := array.NewInt64Builder(mem)
-    nameBuilder := array.NewStringBuilder(mem)
-    
-    idBuilder.Append(1)
-    nameBuilder.Append("Alice")
-    
-    idArray := idBuilder.NewArray()
-    nameArray := nameBuilder.NewArray()
-    record := array.NewRecord(schema, []arrow.Array{idArray, nameArray}, 1)
-
-    // Write data
-    ctx := context.Background()
-    err = lb.Write(ctx, record, lockbox.WithPassword("mypassword123"))
-    if err != nil {
-        log.Fatal(err)
-    }
-
-    // Read data back
-    readRecord, err := lb.Read(ctx, lockbox.WithPassword("mypassword123"))
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer readRecord.Release()
-
-    log.Printf("Read %d rows with %d columns", readRecord.NumRows(), len(readRecord.Columns()))
-}
-```
-
-## Architecture
-
-### File Format (.lbx)
+An `.lbx` file starts with a small header followed by encrypted column blocks and a JSON metadata section.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -157,135 +25,100 @@ func main() {
 ├─────────────────────────────────────────────────────────────┤
 │                   Encrypted Data Blocks                     │
 │  ┌─────────────────────────────────────────────────────────┐│
-│  │ Block 1: Column A (Hybrid Encrypted Arrow RecordBatch)  ││
+│  │ Block 1: Column A (Encrypted Arrow RecordBatch)         ││
 │  ├─────────────────────────────────────────────────────────┤│
-│  │ Block 2: Column B (Hybrid Encrypted Arrow RecordBatch)  ││
+│  │ Block 2: Column B (Encrypted Arrow RecordBatch)         ││
 │  ├─────────────────────────────────────────────────────────┤│
-│  │ Block N: Column N (Hybrid Encrypted Arrow RecordBatch)  ││
+│  │ ...                                                     ││
 │  └─────────────────────────────────────────────────────────┘│
 ├─────────────────────────────────────────────────────────────┤
 │                    Metadata Block                           │
-│  - Schema Information                                       │
-│  - Encryption Parameters                                    │
-│  - Post-Quantum Key Material                                │
-│  - Block Information & Checksums                            │
-│  - Audit Trail                                              │
+│  - Schema information                                       │
+│  - Encryption parameters                                    │
+│  - Post‑quantum key material                                │
+│  - Block information & checksums                            │
+│  - Audit trail                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### Security Model
+The metadata keeps the Arrow schema, salts for each column and an audit log so the file can be validated and repaired if needed.
 
-**Encryption**:
+## Getting Started
 
-- **Classical Algorithm**: AES-256-GCM for authenticated encryption
-- **Post-Quantum Algorithm**: Kyber (lattice-based) for key exchange
-- **Key Derivation**: PBKDF2 with 100,000 iterations
-- **Column-Level Keys**: Each column encrypted with derived keys
-- **Perfect Forward Secrecy**: Ephemeral keypairs for each operation
-- **Integrity**: SHA-256 checksums for all encrypted blocks
-- **Signatures**: Schnorr signatures based on Kyber for authentication
+### Build and Test
 
-**Key Management**:
+```bash
+# Build the CLI
+go build ./cmd/lockbox
 
-```
-Master Key = PBKDF2(Password, Salt, 100000 iterations)
-Column Key = PBKDF2(Master Key + Column Name, Salt, 100000 iterations)
-Ephemeral Key = Kyber.GenerateKeyPair()  # For each operation
-Shared Secret = Kyber.KeyExchange(Ephemeral Key, Column Key)
-Hybrid Key = SHA256(Column Key || Shared Secret)
+# Run unit tests
+go test ./...
 ```
 
-### Performance Characteristics
+### Creating and Querying a Lockbox
 
-The MVP implementation focuses on correctness and security while maintaining reasonable performance:
+```bash
+# Create a new file with the default schema
+./lockbox create mydata.lbx --password secret
 
-- **Encryption Overhead**: ~20-25% compared to unencrypted Arrow (includes post-quantum operations)
-- **Column Selectivity**: Only decrypt requested columns
-- **Memory Efficiency**: Zero-copy Arrow operations where possible
-- **File Size**: ~10-15% overhead for metadata, encryption, and post-quantum material
+# Write some example rows
+./lockbox write mydata.lbx --sample --password secret
+
+# Inspect the file
+./lockbox info mydata.lbx --password secret
+
+# Run a simple query
+./lockbox query mydata.lbx --password secret
+```
+
+### Custom Schemas
+
+You can pass a JSON schema when creating a file.
+
+```json
+{
+  "fields": [
+    {"name": "user_id", "type": "int64", "nullable": false},
+    {"name": "username", "type": "string", "nullable": false},
+    {"name": "created_at", "type": "timestamp", "nullable": false}
+  ]
+}
+```
+
+```bash
+./lockbox create users.lbx --schema schema.json --password secret
+```
+
+### Go SDK Example
+
+```go
+lb, err := lockbox.Create("data.lbx", schema,
+    lockbox.WithPassword("secret"),
+    lockbox.WithCreatedBy("example"),
+)
+if err != nil {
+    log.Fatal(err)
+}
+defer lb.Close()
+
+// Write and read records just like with the CLI
+```
+
+## Security Overview
+
+- AES‑256‑GCM for column encryption
+- Kyber based key exchange for post‑quantum protection
+- PBKDF2‑derived master key and column keys
+- Optional signatures using the Kyber key pair
+
+Only the columns needed for a query are decrypted which keeps operations fast.
 
 ## CLI Reference
 
-### Commands
+- `create` – create a new lockbox file
+- `write` – append data to an existing file
+- `query` – run a basic SQL‑like query against the data
+- `info` – display schema and audit information
 
-#### `create`
+Run any command with `--help` for detailed flags.
 
-Create a new lockbox file with specified schema.
-
-```bash
-lockbox create [file] --password [password] [options]
-
-Options:
-  -s, --schema string      JSON schema file
-  -p, --password string    Password for encryption (required)
-      --created-by string  Creator name (default "system")
-```
-
-#### `write`
-
-Write data to an existing lockbox file.
-
-```bash
-lockbox write [file] --password [password] [options]
-
-Options:
-  -i, --input string     Input data file (CSV, JSON)
-  -p, --password string  Password for encryption
-      --sample           Generate sample data
-```
-
-#### `query`
-
-Query data from a lockbox file.
-
-```bash
-lockbox query [file] --password [password] [options]
-
-Options:
-  -q, --sql string       SQL query to execute (default "SELECT * FROM data")
-      --columns string   Column projection shorthand
-  -p, --password string  Password for decryption
-  -o, --output string    Output format (table, json, csv) (default "table")
-```
-
-#### `info`
-
-Display information about a lockbox file.
-
-```bash
-lockbox info [file] --password [password] [options]
-
-Options:
-  -p, --password string  Password for decryption
-  -o, --output string    Output format (table, json) (default "table")
-```
-
-### Global Options
-
-```bash
-Options:
-  -v, --verbose          Enable verbose output
-      --config string    Config file (default is $HOME/.lockbox.yaml)
-```
-
-## Advanced Queries with Lockbox
-
-Lockbox supports a subset of SQL for in-memory querying. Only columns referenced
-in the query are decrypted.
-
-Example:
-
-```bash
-lockbox query userdata.lbx --password hunter2 \
-  --sql "SELECT user_id, score FROM data WHERE score > 50 ORDER BY score DESC LIMIT 5" \
-  --output json
-```
-
-You can also use the `--columns` shorthand:
-
-```bash
-lockbox query userdata.lbx --password hunter2 --columns user_id,email
-```
-
-Supported features: `SELECT`, `WHERE`, `ORDER BY`, `LIMIT` with basic numeric
-filters and ordering.
