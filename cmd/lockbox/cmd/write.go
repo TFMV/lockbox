@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -36,6 +37,7 @@ Supported input formats:
 		inputFile, _ := cmd.Flags().GetString("input")
 		password, _ := cmd.Flags().GetString("password")
 		sampleData, _ := cmd.Flags().GetBool("sample")
+		format, _ := cmd.Flags().GetString("format")
 
 		// Get password if not provided
 		if password == "" {
@@ -65,9 +67,15 @@ Supported input formats:
 			if err != nil {
 				return fmt.Errorf("failed to generate sample data: %w", err)
 			}
-		} else if inputFile != "" {
+		} else if inputFile != "" && format == "csv" {
 			// Load data from file
 			record, err = loadDataFromFile(inputFile, lb.Schema())
+			if err != nil {
+				return fmt.Errorf("failed to load data from file: %w", err)
+			}
+		} else if inputFile != "" && format == "json" {
+			// Load data from file
+			record, err = loadDataFromJSON(inputFile, lb.Schema())
 			if err != nil {
 				return fmt.Errorf("failed to load data from file: %w", err)
 			}
@@ -92,6 +100,7 @@ func init() {
 	rootCmd.AddCommand(writeCmd)
 
 	writeCmd.Flags().StringP("input", "i", "", "Input data file (CSV, JSON)")
+	writeCmd.Flags().StringP("format", "f", "", "Input data format (csv, json)")
 	writeCmd.Flags().StringP("password", "p", "", "Password for encryption")
 	writeCmd.Flags().Bool("sample", false, "Generate sample data")
 }
@@ -297,6 +306,182 @@ func loadDataFromFile(filename string, schema *arrow.Schema) (arrow.Record, erro
 	record := array.NewRecord(schema, arrays, numRows)
 
 	// Clean up arrays
+	for _, arr := range arrays {
+		arr.Release()
+	}
+
+	return record, nil
+}
+
+func loadDataFromJSON(filename string, schema *arrow.Schema) (arrow.Record, error) {
+	mem := memory.NewGoAllocator()
+	numFields := len(schema.Fields())
+
+	// Create builders for each column
+	builders := make([]array.Builder, numFields)
+	for i, field := range schema.Fields() {
+		switch typ := field.Type.(type) {
+		case *arrow.Int64Type:
+			builders[i] = array.NewInt64Builder(mem)
+		case *arrow.Int32Type:
+			builders[i] = array.NewInt32Builder(mem)
+		case *arrow.Float64Type:
+			builders[i] = array.NewFloat64Builder(mem)
+		case *arrow.StringType:
+			builders[i] = array.NewStringBuilder(mem)
+		case *arrow.TimestampType:
+			builders[i] = array.NewTimestampBuilder(mem, typ)
+		default:
+			return nil, fmt.Errorf("unsupported type: %v", field.Type)
+		}
+	}
+
+	// Open JSON file
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file: %w", err)
+	}
+	defer f.Close()
+
+	// Read JSON: try as array, else NDJSON fallback
+	dec := json.NewDecoder(f)
+	var records []map[string]interface{}
+	// Try to decode as array of objects
+	if err := dec.Decode(&records); err != nil {
+		// Reset file pointer and try NDJSON (one object per line)
+		if _, err2 := f.Seek(0, io.SeekStart); err2 != nil {
+			return nil, fmt.Errorf("invalid JSON format, and seek failed: %w", err)
+		}
+		dec = json.NewDecoder(f)
+		records = []map[string]interface{}{}
+		for {
+			var row map[string]interface{}
+			if err := dec.Decode(&row); err != nil {
+				if err == io.EOF {
+					break
+				}
+				return nil, fmt.Errorf("JSON decode error: %w", err)
+			}
+			records = append(records, row)
+		}
+	}
+
+	// Process records
+	for rowNum, rec := range records {
+		for i, field := range schema.Fields() {
+			val, ok := rec[field.Name]
+			if !ok || val == nil {
+				if field.Nullable {
+					builders[i].AppendNull()
+					continue
+				}
+				return nil, fmt.Errorf("row %d: missing non-nullable field '%s'", rowNum+1, field.Name)
+			}
+			switch typ := field.Type.(type) {
+			case *arrow.Int64Type:
+				switch v := val.(type) {
+				case float64: // json.Unmarshal converts numbers to float64
+					builders[i].(*array.Int64Builder).Append(int64(v))
+				case string:
+					if v == "" && field.Nullable {
+						builders[i].(*array.Int64Builder).AppendNull()
+					} else {
+						num, err := strconv.ParseInt(v, 10, 64)
+						if err != nil {
+							return nil, fmt.Errorf("row %d, col %s: invalid int64: %v", rowNum+1, field.Name, v)
+						}
+						builders[i].(*array.Int64Builder).Append(num)
+					}
+				default:
+					return nil, fmt.Errorf("row %d, col %s: expected int64, got %T", rowNum+1, field.Name, val)
+				}
+			case *arrow.Int32Type:
+				switch v := val.(type) {
+				case float64:
+					builders[i].(*array.Int32Builder).Append(int32(v))
+				case string:
+					if v == "" && field.Nullable {
+						builders[i].(*array.Int32Builder).AppendNull()
+					} else {
+						num, err := strconv.ParseInt(v, 10, 32)
+						if err != nil {
+							return nil, fmt.Errorf("row %d, col %s: invalid int32: %v", rowNum+1, field.Name, v)
+						}
+						builders[i].(*array.Int32Builder).Append(int32(num))
+					}
+				default:
+					return nil, fmt.Errorf("row %d, col %s: expected int32, got %T", rowNum+1, field.Name, val)
+				}
+			case *arrow.Float64Type:
+				switch v := val.(type) {
+				case float64:
+					builders[i].(*array.Float64Builder).Append(v)
+				case string:
+					if v == "" && field.Nullable {
+						builders[i].(*array.Float64Builder).AppendNull()
+					} else {
+						num, err := strconv.ParseFloat(v, 64)
+						if err != nil {
+							return nil, fmt.Errorf("row %d, col %s: invalid float64: %v", rowNum+1, field.Name, v)
+						}
+						builders[i].(*array.Float64Builder).Append(num)
+					}
+				default:
+					return nil, fmt.Errorf("row %d, col %s: expected float64, got %T", rowNum+1, field.Name, val)
+				}
+			case *arrow.StringType:
+				switch v := val.(type) {
+				case string:
+					if v == "" && field.Nullable {
+						builders[i].(*array.StringBuilder).AppendNull()
+					} else {
+						builders[i].(*array.StringBuilder).Append(v)
+					}
+				default:
+					builders[i].(*array.StringBuilder).Append(fmt.Sprintf("%v", val))
+				}
+			case *arrow.TimestampType:
+				switch v := val.(type) {
+				case string:
+					if v == "" && field.Nullable {
+						builders[i].(*array.TimestampBuilder).AppendNull()
+						continue
+					}
+					tm, err := time.Parse(time.RFC3339, v)
+					if err != nil {
+						return nil, fmt.Errorf("row %d, col %s: invalid timestamp: %v", rowNum+1, field.Name, v)
+					}
+					var epoch int64
+					switch typ.Unit {
+					case arrow.Second:
+						epoch = tm.Unix()
+					case arrow.Millisecond:
+						epoch = tm.UnixMilli()
+					case arrow.Microsecond:
+						epoch = tm.UnixMicro()
+					case arrow.Nanosecond:
+						epoch = tm.UnixNano()
+					default:
+						return nil, fmt.Errorf("unknown timestamp unit: %v", typ.Unit)
+					}
+					builders[i].(*array.TimestampBuilder).Append(arrow.Timestamp(epoch))
+				default:
+					return nil, fmt.Errorf("row %d, col %s: invalid timestamp type: %T", rowNum+1, field.Name, val)
+				}
+			default:
+				return nil, fmt.Errorf("unsupported type: %v", field.Type)
+			}
+		}
+	}
+
+	// Build Arrow arrays and record
+	arrays := make([]arrow.Array, numFields)
+	for i, b := range builders {
+		arrays[i] = b.NewArray()
+		b.Release()
+	}
+	numRows := int64(arrays[0].Len())
+	record := array.NewRecord(schema, arrays, numRows)
 	for _, arr := range arrays {
 		arr.Release()
 	}
