@@ -374,8 +374,14 @@ func (lb *Lockbox) Query(ctx context.Context, query string, opts ...Option) (arr
 	return result, nil
 }
 
+type aggregateSpec struct {
+	Func string
+	Col  string
+}
+
 type parsedQuery struct {
 	SelectCols []string
+	Aggregates []aggregateSpec
 	WhereCol   string
 	WhereOp    string
 	WhereVal   string
@@ -406,10 +412,29 @@ func parseQuery(q string) (*parsedQuery, error) {
 
 	selectRaw := strings.Join(parts[1:fromIdx], " ")
 	cols := strings.Split(selectRaw, ",")
-	for i := range cols {
-		c := strings.TrimSpace(cols[i])
-		if c != "*" && c != "" {
-			pq.SelectCols = append(pq.SelectCols, strings.ToLower(c))
+	for _, raw := range cols {
+		c := strings.TrimSpace(raw)
+		u := strings.ToUpper(c)
+		switch {
+		case strings.HasPrefix(u, "COUNT(") && strings.HasSuffix(c, ")"):
+			col := strings.TrimSuffix(c[len("COUNT("):], ")")
+			pq.Aggregates = append(pq.Aggregates, aggregateSpec{Func: "COUNT", Col: strings.ToLower(col)})
+		case strings.HasPrefix(u, "SUM(") && strings.HasSuffix(c, ")"):
+			col := strings.TrimSuffix(c[len("SUM("):], ")")
+			pq.Aggregates = append(pq.Aggregates, aggregateSpec{Func: "SUM", Col: strings.ToLower(col)})
+		case strings.HasPrefix(u, "AVG(") && strings.HasSuffix(c, ")"):
+			col := strings.TrimSuffix(c[len("AVG("):], ")")
+			pq.Aggregates = append(pq.Aggregates, aggregateSpec{Func: "AVG", Col: strings.ToLower(col)})
+		case strings.HasPrefix(u, "MIN(") && strings.HasSuffix(c, ")"):
+			col := strings.TrimSuffix(c[len("MIN("):], ")")
+			pq.Aggregates = append(pq.Aggregates, aggregateSpec{Func: "MIN", Col: strings.ToLower(col)})
+		case strings.HasPrefix(u, "MAX(") && strings.HasSuffix(c, ")"):
+			col := strings.TrimSuffix(c[len("MAX("):], ")")
+			pq.Aggregates = append(pq.Aggregates, aggregateSpec{Func: "MAX", Col: strings.ToLower(col)})
+		default:
+			if c != "" && c != "*" {
+				pq.SelectCols = append(pq.SelectCols, strings.ToLower(c))
+			}
 		}
 	}
 
@@ -485,6 +510,45 @@ func applyQuery(rec arrow.Record, pq *parsedQuery) (arrow.Record, error) {
 			}
 			return less(va, vb)
 		})
+	}
+
+	// Aggregations (before LIMIT)
+	if len(pq.Aggregates) > 0 {
+		arrays := make([]arrow.Array, len(pq.Aggregates))
+		fields := make([]arrow.Field, len(pq.Aggregates))
+
+		for i, ag := range pq.Aggregates {
+			val, dt, err := computeAggregate(rec, idx, ag)
+			if err != nil {
+				return nil, err
+			}
+			fields[i] = arrow.Field{Name: fmt.Sprintf("%s_%s", strings.ToLower(ag.Func), ag.Col), Type: dt}
+			switch dt.ID() {
+			case arrow.INT64:
+				b := array.NewInt64Builder(mem)
+				b.Append(val.(int64))
+				arrays[i] = b.NewArray()
+				b.Release()
+			case arrow.FLOAT64:
+				b := array.NewFloat64Builder(mem)
+				b.Append(val.(float64))
+				arrays[i] = b.NewArray()
+				b.Release()
+			case arrow.STRING:
+				b := array.NewStringBuilder(mem)
+				b.Append(val.(string))
+				arrays[i] = b.NewArray()
+				b.Release()
+			default:
+				b := array.NewStringBuilder(mem)
+				b.Append(fmt.Sprintf("%v", val))
+				arrays[i] = b.NewArray()
+				b.Release()
+			}
+		}
+
+		schema := arrow.NewSchema(fields, nil)
+		return array.NewRecord(schema, arrays, 1), nil
 	}
 
 	// LIMIT
@@ -628,6 +692,115 @@ func appendValue(b array.Builder, col arrow.Array, row int) {
 	case *array.Timestamp:
 		b.(*array.TimestampBuilder).Append(c.Value(row))
 	}
+}
+
+func computeAggregate(rec arrow.Record, idx []int, ag aggregateSpec) (interface{}, arrow.DataType, error) {
+	switch ag.Func {
+	case "COUNT":
+		return int64(len(idx)), arrow.PrimitiveTypes.Int64, nil
+	case "SUM", "AVG", "MIN", "MAX":
+		if ag.Col == "" || ag.Col == "*" {
+			return nil, nil, fmt.Errorf("aggregate %s requires column", ag.Func)
+		}
+		fIdx := rec.Schema().FieldIndices(ag.Col)
+		if len(fIdx) == 0 {
+			return nil, nil, fmt.Errorf("column %s not found", ag.Col)
+		}
+		col := rec.Column(fIdx[0])
+		switch c := col.(type) {
+		case *array.Int64:
+			if len(idx) == 0 {
+				switch ag.Func {
+				case "SUM", "AVG":
+					return float64(0), arrow.PrimitiveTypes.Float64, nil
+				default:
+					return int64(0), arrow.PrimitiveTypes.Int64, nil
+				}
+			}
+			var sum int64
+			min := c.Value(idx[0])
+			max := c.Value(idx[0])
+			for _, i := range idx {
+				if c.IsNull(i) {
+					continue
+				}
+				v := c.Value(i)
+				sum += v
+				if v < min {
+					min = v
+				}
+				if v > max {
+					max = v
+				}
+			}
+			switch ag.Func {
+			case "SUM":
+				return float64(sum), arrow.PrimitiveTypes.Float64, nil
+			case "AVG":
+				return float64(sum) / float64(len(idx)), arrow.PrimitiveTypes.Float64, nil
+			case "MIN":
+				return min, arrow.PrimitiveTypes.Int64, nil
+			case "MAX":
+				return max, arrow.PrimitiveTypes.Int64, nil
+			}
+		case *array.Float64:
+			if len(idx) == 0 {
+				return float64(0), arrow.PrimitiveTypes.Float64, nil
+			}
+			var sum, min, max float64
+			min = c.Value(idx[0])
+			max = c.Value(idx[0])
+			for _, i := range idx {
+				if c.IsNull(i) {
+					continue
+				}
+				v := c.Value(i)
+				sum += v
+				if v < min {
+					min = v
+				}
+				if v > max {
+					max = v
+				}
+			}
+			switch ag.Func {
+			case "SUM":
+				return sum, arrow.PrimitiveTypes.Float64, nil
+			case "AVG":
+				return sum / float64(len(idx)), arrow.PrimitiveTypes.Float64, nil
+			case "MIN":
+				return min, arrow.PrimitiveTypes.Float64, nil
+			case "MAX":
+				return max, arrow.PrimitiveTypes.Float64, nil
+			}
+		case *array.String:
+			if ag.Func != "MIN" && ag.Func != "MAX" {
+				return nil, nil, fmt.Errorf("unsupported aggregate on string")
+			}
+			if len(idx) == 0 {
+				return "", arrow.BinaryTypes.String, nil
+			}
+			min := c.Value(idx[0])
+			max := c.Value(idx[0])
+			for _, i := range idx {
+				if c.IsNull(i) {
+					continue
+				}
+				v := c.Value(i)
+				if v < min {
+					min = v
+				}
+				if v > max {
+					max = v
+				}
+			}
+			if ag.Func == "MIN" {
+				return min, arrow.BinaryTypes.String, nil
+			}
+			return max, arrow.BinaryTypes.String, nil
+		}
+	}
+	return nil, nil, fmt.Errorf("unsupported aggregate")
 }
 
 func less(a, b interface{}) bool {
