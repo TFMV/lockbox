@@ -28,6 +28,7 @@ type LockboxFile struct {
 	file     *os.File
 	metadata *metadata.Metadata
 	readonly bool
+	module   crypto.Module
 }
 
 // Writer handles writing encrypted Arrow data to lockbox files
@@ -35,6 +36,7 @@ type Writer struct {
 	file       *LockboxFile
 	encryptors map[string]*crypto.ColumnEncryptor
 	masterKey  []byte
+	module     crypto.Module
 }
 
 // Reader handles reading encrypted Arrow data from lockbox files
@@ -42,12 +44,17 @@ type Reader struct {
 	file       *LockboxFile
 	encryptors map[string]*crypto.ColumnEncryptor
 	masterKey  []byte
+	module     crypto.Module
 }
 
 // Create creates a new lockbox file
-func Create(filename string, schema *arrow.Schema, password string, createdBy string) (*LockboxFile, error) {
+func Create(filename string, schema *arrow.Schema, password string, createdBy string, module crypto.Module) (*LockboxFile, error) {
+	if module == nil {
+		module, _ = crypto.GetModule("default")
+	}
+
 	// Generate master key
-	masterKey, err := crypto.NewKey(password)
+	masterKey, err := module.NewKey(password)
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate master key: %w", err)
 	}
@@ -71,6 +78,7 @@ func Create(filename string, schema *arrow.Schema, password string, createdBy st
 		file:     file,
 		metadata: meta,
 		readonly: false,
+		module:   module,
 	}
 
 	// Write header and metadata
@@ -92,7 +100,10 @@ func Create(filename string, schema *arrow.Schema, password string, createdBy st
 }
 
 // Open opens an existing lockbox file
-func Open(filename string, password string) (*LockboxFile, error) {
+func Open(filename string, password string, module crypto.Module) (*LockboxFile, error) {
+	if module == nil {
+		module, _ = crypto.GetModule("default")
+	}
 	file, err := os.OpenFile(filename, os.O_RDWR, 0644)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open file: %w", err)
@@ -101,6 +112,7 @@ func Open(filename string, password string) (*LockboxFile, error) {
 	lbf := &LockboxFile{
 		file:     file,
 		readonly: false,
+		module:   module,
 	}
 
 	// Read header and metadata
@@ -110,7 +122,7 @@ func Open(filename string, password string) (*LockboxFile, error) {
 	}
 
 	// Verify password by attempting to derive key
-	derivedKey := crypto.DeriveKey(password, lbf.metadata.Encryption.MasterSalt)
+	derivedKey := module.DeriveKey(password, lbf.metadata.Encryption.MasterSalt)
 	if derivedKey == nil {
 		file.Close()
 		return nil, fmt.Errorf("invalid password")
@@ -144,8 +156,13 @@ func (lbf *LockboxFile) NewWriter(password string) (*Writer, error) {
 		return nil, fmt.Errorf("file is read-only")
 	}
 
+	module := lbf.module
+	if module == nil {
+		module, _ = crypto.GetModule("default")
+	}
+
 	// Derive master key
-	masterKey := crypto.DeriveKey(password, lbf.metadata.Encryption.MasterSalt)
+	masterKey := module.DeriveKey(password, lbf.metadata.Encryption.MasterSalt)
 	if masterKey == nil {
 		return nil, fmt.Errorf("failed to derive master key")
 	}
@@ -154,10 +171,11 @@ func (lbf *LockboxFile) NewWriter(password string) (*Writer, error) {
 	encryptors := make(map[string]*crypto.ColumnEncryptor)
 	for i, field := range lbf.metadata.Schema.Fields() {
 		columnKey := crypto.DeriveColumnKey(masterKey.Data, field.Name, lbf.metadata.Encryption.MasterSalt)
-		encryptor, err := crypto.NewColumnEncryptor(columnKey)
+		encryptorIntf, err := module.NewEncryptor(columnKey)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create encryptor for column %s: %w", field.Name, err)
 		}
+		encryptor := encryptorIntf.(*crypto.ColumnEncryptor)
 
 		// Initialize post-quantum components
 		if masterKey.KyberPublicKey != nil && masterKey.KyberSecretKey != nil {
@@ -173,13 +191,19 @@ func (lbf *LockboxFile) NewWriter(password string) (*Writer, error) {
 		file:       lbf,
 		encryptors: encryptors,
 		masterKey:  masterKey.Data,
+		module:     module,
 	}, nil
 }
 
 // NewReader creates a new reader for the lockbox file
 func (lbf *LockboxFile) NewReader(password string) (*Reader, error) {
+	module := lbf.module
+	if module == nil {
+		module, _ = crypto.GetModule("default")
+	}
+
 	// Derive master key
-	masterKey := crypto.DeriveKey(password, lbf.metadata.Encryption.MasterSalt)
+	masterKey := module.DeriveKey(password, lbf.metadata.Encryption.MasterSalt)
 	if masterKey == nil {
 		return nil, fmt.Errorf("failed to derive master key")
 	}
@@ -188,10 +212,11 @@ func (lbf *LockboxFile) NewReader(password string) (*Reader, error) {
 	encryptors := make(map[string]*crypto.ColumnEncryptor)
 	for i, field := range lbf.metadata.Schema.Fields() {
 		columnKey := crypto.DeriveColumnKey(masterKey.Data, field.Name, lbf.metadata.Encryption.MasterSalt)
-		encryptor, err := crypto.NewColumnEncryptor(columnKey)
+		encryptorIntf, err := module.NewEncryptor(columnKey)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create encryptor for column %s: %w", field.Name, err)
 		}
+		encryptor := encryptorIntf.(*crypto.ColumnEncryptor)
 
 		// Initialize post-quantum components
 		if masterKey.KyberPublicKey != nil && masterKey.KyberSecretKey != nil {
@@ -207,6 +232,7 @@ func (lbf *LockboxFile) NewReader(password string) (*Reader, error) {
 		file:       lbf,
 		encryptors: encryptors,
 		masterKey:  masterKey.Data,
+		module:     module,
 	}, nil
 }
 
