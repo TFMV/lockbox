@@ -1,3 +1,3 @@
 [x] IngestParquet
 [x] IngestCSV
-[ ] IngestJSON
+[x] IngestJSON

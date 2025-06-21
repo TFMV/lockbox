@@ -54,6 +54,12 @@ go test ./pkg/lockbox -v
 # Write sample data
 ./lockbox write mydata.lbx --sample --password mypassword123
 
+# Write CSV data
+./lockbox write mydata.lbx --input <csv_data_file_path> --format csv --password mypassword123
+
+# Write JSON data
+./lockbox write mydata.lbx --input <json_data_file_path> --format json --password mypassword123
+
 # Query data (basic implementation)
 ./lockbox query mydata.lbx --password mypassword123
 ```
