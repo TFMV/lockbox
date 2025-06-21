@@ -64,6 +64,12 @@ go test ./...
 # Write some example rows
 ./lockbox write mydata.lbx --sample --password secret
 
+# Write some CSV data
+./lockbox write mydata.lbx --input <csv_data_file_path> --format csv --password secret
+
+# Write some JSON data
+./lockbox write mydata.lbx --input <json_data_file_path> --format json --password secret
+
 # Inspect the file
 ./lockbox info mydata.lbx --password secret
 
