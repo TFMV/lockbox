@@ -245,6 +245,7 @@ func (w *Writer) WriteRecord(record arrow.Record) error {
 		field    arrow.Field
 		data     []byte
 		checksum [32]byte
+		origSize int64
 		err      error
 	}
 
@@ -276,6 +277,8 @@ func (w *Writer) WriteRecord(record arrow.Record) error {
 			writer.Close()
 			batch.Release()
 
+			origSize := int64(buf.Len())
+
 			encryptor, exists := w.encryptors[field.Name]
 			if !exists {
 				results[idx].err = fmt.Errorf("no encryptor for column %s", field.Name)
@@ -289,7 +292,7 @@ func (w *Writer) WriteRecord(record arrow.Record) error {
 			}
 
 			checksum := sha256.Sum256(enc)
-			results[idx] = result{field: field, data: enc, checksum: checksum}
+			results[idx] = result{field: field, data: enc, checksum: checksum, origSize: origSize}
 		}(i, col, field)
 	}
 	wg.Wait()
@@ -311,12 +314,21 @@ func (w *Writer) WriteRecord(record arrow.Record) error {
 			return fmt.Errorf("failed to write encrypted data: %w", err)
 		}
 
+		mime := ""
+		if r.field.Metadata.Len() > 0 {
+			if v, ok := r.field.Metadata.GetValue("mime"); ok {
+				mime = v
+			}
+		}
+
 		w.file.metadata.AddBlockInfo(
 			r.field.Name,
 			blockStart,
 			int64(len(r.data)),
 			record.NumRows(),
 			r.checksum[:],
+			r.origSize,
+			mime,
 		)
 
 		log.Debug().

@@ -851,6 +851,37 @@ func (lb *Lockbox) Repair() error {
 	return lb.file.Repair()
 }
 
+// GetBlob returns the blob data for the given field and row index.
+func (lb *Lockbox) GetBlob(field string, row int, opts ...Option) ([]byte, error) {
+	ctx := context.Background()
+	rec, err := lb.Read(ctx, opts...)
+	if err != nil {
+		return nil, err
+	}
+	defer rec.Release()
+
+	idx := rec.Schema().FieldIndices(field)
+	if len(idx) == 0 {
+		return nil, fmt.Errorf("field %s not found", field)
+	}
+
+	col := rec.Column(idx[0])
+	switch arr := col.(type) {
+	case *array.Binary:
+		if row >= arr.Len() {
+			return nil, fmt.Errorf("row out of bounds")
+		}
+		return arr.Value(row), nil
+	case *array.LargeBinary:
+		if row >= arr.Len() {
+			return nil, fmt.Errorf("row out of bounds")
+		}
+		return arr.Value(row), nil
+	default:
+		return nil, fmt.Errorf("field %s is not binary", field)
+	}
+}
+
 // Info represents information about a lockbox file
 type Info struct {
 	Version     uint32        `json:"version"`
