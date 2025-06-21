@@ -94,6 +94,7 @@ func loadSchemaFromFile(filename string) (*arrow.Schema, error) {
 		Name     string `json:"name"`
 		Type     string `json:"type"`
 		Nullable bool   `json:"nullable"`
+		Mime     string `json:"mime,omitempty"`
 	}
 
 	type SchemaJSON struct {
@@ -120,6 +121,8 @@ func loadSchemaFromFile(filename string) (*arrow.Schema, error) {
 			dataType = arrow.PrimitiveTypes.Float32
 		case "string":
 			dataType = arrow.BinaryTypes.String
+		case "binary", "blob":
+			dataType = arrow.BinaryTypes.Binary
 		case "date":
 			dataType = arrow.FixedWidthTypes.Date32
 		case "timestamp":
@@ -134,10 +137,16 @@ func loadSchemaFromFile(filename string) (*arrow.Schema, error) {
 			return nil, fmt.Errorf("unsupported type: %s", field.Type)
 		}
 
+		var md arrow.Metadata
+		if field.Mime != "" {
+			md = arrow.NewMetadata([]string{"mime"}, []string{field.Mime})
+		}
+
 		fields = append(fields, arrow.Field{
 			Name:     field.Name,
 			Type:     dataType,
 			Nullable: field.Nullable,
+			Metadata: md,
 		})
 	}
 

@@ -103,6 +103,8 @@ type BlockInfo struct {
 	RowCount   int64  `json:"rowCount"`
 	Compressed bool   `json:"compressed"`
 	Checksum   []byte `json:"checksum"`
+	OrigSize   int64  `json:"origSize,omitempty"`
+	MimeType   string `json:"mimeType,omitempty"`
 }
 
 // NewMetadata creates new metadata for a lockbox file
@@ -190,7 +192,7 @@ func Deserialize(data []byte) (*Metadata, error) {
 }
 
 // AddBlockInfo adds information about an encrypted block
-func (m *Metadata) AddBlockInfo(columnName string, offset, length, rowCount int64, checksum []byte) {
+func (m *Metadata) AddBlockInfo(columnName string, offset, length, rowCount int64, checksum []byte, origSize int64, mime string) {
 	m.BlockInfo = append(m.BlockInfo, BlockInfo{
 		ColumnName: columnName,
 		Offset:     offset,
@@ -198,6 +200,8 @@ func (m *Metadata) AddBlockInfo(columnName string, offset, length, rowCount int6
 		RowCount:   rowCount,
 		Compressed: false,
 		Checksum:   checksum,
+		OrigSize:   origSize,
+		MimeType:   mime,
 	})
 }
 

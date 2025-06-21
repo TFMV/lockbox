@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -38,6 +39,7 @@ Supported input formats:
 		password, _ := cmd.Flags().GetString("password")
 		sampleData, _ := cmd.Flags().GetBool("sample")
 		format, _ := cmd.Flags().GetString("format")
+		blobArgs, _ := cmd.Flags().GetStringArray("blob")
 
 		// Get password if not provided
 		if password == "" {
@@ -57,11 +59,18 @@ Supported input formats:
 		}
 		defer lb.Close()
 
+		blobMap := parseBlobArgs(blobArgs)
+
 		ctx := context.Background()
 
 		var record arrow.Record
 
-		if sampleData {
+		if len(blobMap) > 0 {
+			record, err = loadBlobRecord(blobMap, lb.Schema())
+			if err != nil {
+				return fmt.Errorf("failed to load blob data: %w", err)
+			}
+		} else if sampleData {
 			// Generate sample data
 			record, err = generateSampleData(lb.Schema())
 			if err != nil {
@@ -103,6 +112,7 @@ func init() {
 	writeCmd.Flags().StringP("format", "f", "", "Input data format (csv, json)")
 	writeCmd.Flags().StringP("password", "p", "", "Password for encryption")
 	writeCmd.Flags().Bool("sample", false, "Generate sample data")
+	writeCmd.Flags().StringArray("blob", []string{}, "Blob field mapping field=file")
 }
 
 // generateSampleData creates sample Arrow data matching the schema
@@ -487,4 +497,62 @@ func loadDataFromJSON(filename string, schema *arrow.Schema) (arrow.Record, erro
 	}
 
 	return record, nil
+}
+
+func parseBlobArgs(args []string) map[string]string {
+	m := make(map[string]string)
+	for _, a := range args {
+		parts := strings.SplitN(a, "=", 2)
+		if len(parts) == 2 {
+			m[parts[0]] = parts[1]
+		}
+	}
+	return m
+}
+
+func loadBlobRecord(blobs map[string]string, schema *arrow.Schema) (arrow.Record, error) {
+	mem := memory.NewGoAllocator()
+
+	builders := make([]array.Builder, len(schema.Fields()))
+	for i, f := range schema.Fields() {
+		switch f.Type.(type) {
+		case *arrow.BinaryType:
+			builders[i] = array.NewBinaryBuilder(mem, arrow.BinaryTypes.Binary)
+		case *arrow.LargeBinaryType:
+			builders[i] = array.NewBinaryBuilder(mem, arrow.BinaryTypes.LargeBinary)
+		case *arrow.StringType:
+			builders[i] = array.NewStringBuilder(mem)
+		default:
+			builders[i] = array.NewStringBuilder(mem)
+		}
+	}
+
+	for i, f := range schema.Fields() {
+		if path, ok := blobs[f.Name]; ok {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return nil, fmt.Errorf("read blob %s: %w", f.Name, err)
+			}
+			switch b := builders[i].(type) {
+			case *array.BinaryBuilder:
+				b.Append(data)
+			case *array.StringBuilder:
+				b.Append(string(data))
+			}
+		} else {
+			builders[i].AppendNull()
+		}
+	}
+
+	arrays := make([]arrow.Array, len(schema.Fields()))
+	for i, b := range builders {
+		arrays[i] = b.NewArray()
+		b.Release()
+	}
+
+	rec := array.NewRecord(schema, arrays, 1)
+	for _, arr := range arrays {
+		arr.Release()
+	}
+	return rec, nil
 }
