@@ -229,6 +229,15 @@ func (lb *Lockbox) Write(ctx context.Context, record arrow.Record, opts ...Optio
 	return nil
 }
 
+// WriteAsync performs Write in a separate goroutine
+func (lb *Lockbox) WriteAsync(ctx context.Context, record arrow.Record, opts ...Option) <-chan error {
+	ch := make(chan error, 1)
+	go func() {
+		ch <- lb.Write(ctx, record, opts...)
+	}()
+	return ch
+}
+
 // Read reads an Arrow record from the lockbox
 func (lb *Lockbox) Read(ctx context.Context, opts ...Option) (arrow.Record, error) {
 	options := &Options{
@@ -265,6 +274,24 @@ func (lb *Lockbox) Read(ctx context.Context, opts ...Option) (arrow.Record, erro
 		Msg("Read record from lockbox")
 
 	return record, nil
+}
+
+// ReadAsync performs Read in a separate goroutine
+func (lb *Lockbox) ReadAsync(ctx context.Context, opts ...Option) (<-chan arrow.Record, <-chan error) {
+	rch := make(chan arrow.Record, 1)
+	ech := make(chan error, 1)
+	go func() {
+		rec, err := lb.Read(ctx, opts...)
+		if err != nil {
+			ech <- err
+			close(rch)
+			close(ech)
+			return
+		}
+		rch <- rec
+		close(ech)
+	}()
+	return rch, ech
 }
 
 // Query performs a simple query on the lockbox data
@@ -618,6 +645,16 @@ func (lb *Lockbox) Info() (*Info, error) {
 	}, nil
 }
 
+// Validate verifies the integrity of the lockbox data blocks
+func (lb *Lockbox) Validate() error {
+	return lb.file.ValidateBlocks()
+}
+
+// Repair attempts to remove corrupted blocks and update metadata
+func (lb *Lockbox) Repair() error {
+	return lb.file.Repair()
+}
+
 // Info represents information about a lockbox file
 type Info struct {
 	Version     uint32        `json:"version"`
@@ -697,6 +734,15 @@ func (lb *Lockbox) IngestParquet(ctx context.Context, path string, opts ...Optio
 
 	log.Info().Str("file", path).Int64("rows", totalRows).Bool("dry_run", options.DryRun).Msg("Ingested parquet")
 	return nil
+}
+
+// IngestParquetAsync runs IngestParquet in a goroutine
+func (lb *Lockbox) IngestParquetAsync(ctx context.Context, path string, opts ...Option) <-chan error {
+	ch := make(chan error, 1)
+	go func() {
+		ch <- lb.IngestParquet(ctx, path, opts...)
+	}()
+	return ch
 }
 
 // validateParquetSchema ensures the parquet schema matches or is a superset of the lockbox schema

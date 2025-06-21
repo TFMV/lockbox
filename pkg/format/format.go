@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"runtime"
+	"sync"
 
 	"github.com/TFMV/lockbox/pkg/crypto"
 	"github.com/TFMV/lockbox/pkg/metadata"
@@ -16,6 +19,9 @@ import (
 	"github.com/apache/arrow-go/v18/arrow/memory"
 	"github.com/rs/zerolog/log"
 )
+
+// ErrCorruptedBlock is returned when a data block fails checksum validation
+var ErrCorruptedBlock = errors.New("corrupted data block")
 
 // LockboxFile represents a lockbox file handle
 type LockboxFile struct {
@@ -209,69 +215,88 @@ func (w *Writer) WriteRecord(record arrow.Record) error {
 	mem := memory.NewGoAllocator()
 	defer record.Release()
 
-	// Get current file position for offset tracking
-	_, err := w.file.file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return fmt.Errorf("failed to get file position: %w", err)
+	type result struct {
+		field    arrow.Field
+		data     []byte
+		checksum [32]byte
+		err      error
 	}
 
-	// Write each column as a separate encrypted block
+	results := make([]result, len(record.Columns()))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, runtime.NumCPU())
+
 	for i, col := range record.Columns() {
 		field := record.Schema().Field(i)
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(idx int, col arrow.Array, field arrow.Field) {
+			defer wg.Done()
+			defer func() { <-sem }()
 
-		// Serialize column to Arrow IPC format
-		var buf bytes.Buffer
-		batch := array.NewRecord(
-			arrow.NewSchema([]arrow.Field{field}, nil),
-			[]arrow.Array{col},
-			record.NumRows(),
-		)
+			var buf bytes.Buffer
+			batch := array.NewRecord(
+				arrow.NewSchema([]arrow.Field{field}, nil),
+				[]arrow.Array{col},
+				record.NumRows(),
+			)
 
-		writer := ipc.NewWriter(&buf, ipc.WithSchema(batch.Schema()), ipc.WithAllocator(mem))
-		if err := writer.Write(batch); err != nil {
+			writer := ipc.NewWriter(&buf, ipc.WithSchema(batch.Schema()), ipc.WithAllocator(mem))
+			if err := writer.Write(batch); err != nil {
+				batch.Release()
+				results[idx].err = fmt.Errorf("failed to serialize column %s: %w", field.Name, err)
+				return
+			}
+			writer.Close()
 			batch.Release()
-			return fmt.Errorf("failed to serialize column %s: %w", field.Name, err)
+
+			encryptor, exists := w.encryptors[field.Name]
+			if !exists {
+				results[idx].err = fmt.Errorf("no encryptor for column %s", field.Name)
+				return
+			}
+
+			enc, err := encryptor.Encrypt(buf.Bytes())
+			if err != nil {
+				results[idx].err = fmt.Errorf("failed to encrypt column %s: %w", field.Name, err)
+				return
+			}
+
+			checksum := sha256.Sum256(enc)
+			results[idx] = result{field: field, data: enc, checksum: checksum}
+		}(i, col, field)
+	}
+	wg.Wait()
+	close(sem)
+
+	for _, r := range results {
+		if r.err != nil {
+			return r.err
 		}
-		writer.Close()
-		batch.Release()
+	}
 
-		// Encrypt the serialized data
-		encryptor, exists := w.encryptors[field.Name]
-		if !exists {
-			return fmt.Errorf("no encryptor for column %s", field.Name)
-		}
-
-		encryptedData, err := encryptor.Encrypt(buf.Bytes())
-		if err != nil {
-			return fmt.Errorf("failed to encrypt column %s: %w", field.Name, err)
-		}
-
-		// Calculate checksum
-		checksum := sha256.Sum256(encryptedData)
-
-		// Write encrypted data
+	for _, r := range results {
 		blockStart, err := w.file.file.Seek(0, io.SeekCurrent)
 		if err != nil {
 			return fmt.Errorf("failed to get block start position: %w", err)
 		}
 
-		if _, err := w.file.file.Write(encryptedData); err != nil {
+		if _, err := w.file.file.Write(r.data); err != nil {
 			return fmt.Errorf("failed to write encrypted data: %w", err)
 		}
 
-		// Update metadata with block info
 		w.file.metadata.AddBlockInfo(
-			field.Name,
+			r.field.Name,
 			blockStart,
-			int64(len(encryptedData)),
+			int64(len(r.data)),
 			record.NumRows(),
-			checksum[:],
+			r.checksum[:],
 		)
 
 		log.Debug().
-			Str("column", field.Name).
+			Str("column", r.field.Name).
 			Int64("offset", blockStart).
-			Int("size", len(encryptedData)).
+			Int("size", len(r.data)).
 			Msg("Wrote encrypted column block")
 	}
 
@@ -289,13 +314,18 @@ func (w *Writer) WriteRecord(record arrow.Record) error {
 // ReadRecord reads and decrypts all columns from the file
 func (r *Reader) ReadRecord() (arrow.Record, error) {
 	mem := memory.NewGoAllocator()
-
-	// Read all column blocks for this record
-	var columns []arrow.Array
 	schema := r.file.metadata.Schema
 
+	type result struct {
+		field arrow.Field
+		arr   arrow.Array
+		err   error
+	}
+
+	results := make([]result, len(schema.Fields()))
+	var wg sync.WaitGroup
+
 	for i, field := range schema.Fields() {
-		// Find block info for this column
 		var blockInfo *metadata.BlockInfo
 		for _, block := range r.file.metadata.BlockInfo {
 			if block.ColumnName == field.Name {
@@ -308,77 +338,91 @@ func (r *Reader) ReadRecord() (arrow.Record, error) {
 			return nil, fmt.Errorf("no block info for column %s", field.Name)
 		}
 
-		// Seek to block position
-		if _, err := r.file.file.Seek(blockInfo.Offset, io.SeekStart); err != nil {
-			return nil, fmt.Errorf("failed to seek to block for column %s: %w", field.Name, err)
-		}
+		wg.Add(1)
+		go func(idx int, f arrow.Field, bi metadata.BlockInfo) {
+			defer wg.Done()
 
-		// Read encrypted data
-		encryptedData := make([]byte, blockInfo.Length)
-		if _, err := io.ReadFull(r.file.file, encryptedData); err != nil {
-			return nil, fmt.Errorf("failed to read encrypted data for column %s: %w", field.Name, err)
-		}
+			encryptedData := make([]byte, bi.Length)
+			if _, err := r.file.file.ReadAt(encryptedData, bi.Offset); err != nil {
+				results[idx].err = fmt.Errorf("failed to read encrypted data for column %s: %w", f.Name, err)
+				return
+			}
 
-		// Verify checksum
-		checksum := sha256.Sum256(encryptedData)
-		if !bytes.Equal(checksum[:], blockInfo.Checksum) {
-			return nil, fmt.Errorf("checksum mismatch for column %s", field.Name)
-		}
+			checksum := sha256.Sum256(encryptedData)
+			if !bytes.Equal(checksum[:], bi.Checksum) {
+				results[idx].err = fmt.Errorf("%w: checksum mismatch for column %s", ErrCorruptedBlock, f.Name)
+				return
+			}
 
-		// Decrypt data
-		encryptor, exists := r.encryptors[field.Name]
-		if !exists {
-			return nil, fmt.Errorf("no encryptor for column %s", field.Name)
-		}
+			encryptor, exists := r.encryptors[f.Name]
+			if !exists {
+				results[idx].err = fmt.Errorf("no encryptor for column %s", f.Name)
+				return
+			}
 
-		decryptedData, err := encryptor.Decrypt(encryptedData)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decrypt column %s: %w", field.Name, err)
-		}
+			dec, err := encryptor.Decrypt(encryptedData)
+			if err != nil {
+				results[idx].err = fmt.Errorf("failed to decrypt column %s: %w", f.Name, err)
+				return
+			}
 
-		// Deserialize Arrow data
-		reader, err := ipc.NewReader(bytes.NewReader(decryptedData), ipc.WithAllocator(mem))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create reader for column %s: %w", field.Name, err)
-		}
+			reader, err := ipc.NewReader(bytes.NewReader(dec), ipc.WithAllocator(mem))
+			if err != nil {
+				results[idx].err = fmt.Errorf("failed to create reader for column %s: %w", f.Name, err)
+				return
+			}
 
-		record, err := reader.Read()
-		if err != nil {
+			rec, err := reader.Read()
+			if err != nil {
+				reader.Release()
+				results[idx].err = fmt.Errorf("failed to read record for column %s: %w", f.Name, err)
+				return
+			}
+
+			if rec.Column(0) == nil {
+				rec.Release()
+				reader.Release()
+				results[idx].err = fmt.Errorf("nil column data for %s", f.Name)
+				return
+			}
+
+			col := rec.Column(0)
+			col.Retain()
+			results[idx] = result{field: f, arr: col}
+			rec.Release()
 			reader.Release()
-			return nil, fmt.Errorf("failed to read record for column %s: %w", field.Name, err)
-		}
 
-		if record.Column(0) == nil {
-			record.Release()
-			reader.Release()
-			return nil, fmt.Errorf("nil column data for %s", field.Name)
-		}
-
-		// Retain the column before releasing the record
-		col := record.Column(0)
-		col.Retain()
-		columns = append(columns, col)
-		record.Release()
-		reader.Release()
-
-		log.Debug().
-			Str("column", field.Name).
-			Int("index", i).
-			Msg("Read and decrypted column")
+			log.Debug().Str("column", f.Name).Int("index", idx).Msg("Read and decrypted column")
+		}(i, field, *blockInfo)
 	}
 
-	// Create combined record
-	result := array.NewRecord(schema, columns, -1)
+	wg.Wait()
 
-	// Release individual columns since NewRecord retains them
-	for _, col := range columns {
-		col.Release()
+	for _, rres := range results {
+		if rres.err != nil {
+			for _, rr := range results {
+				if rr.arr != nil {
+					rr.arr.Release()
+				}
+			}
+			return nil, rres.err
+		}
 	}
 
-	// Log access
-	r.file.metadata.LogAccess("system", "read", "record", true, fmt.Sprintf("read %d rows", result.NumRows()))
+	arrays := make([]arrow.Array, len(results))
+	for i, rres := range results {
+		arrays[i] = rres.arr
+	}
 
-	return result, nil
+	resultRec := array.NewRecord(schema, arrays, -1)
+
+	for _, arr := range arrays {
+		arr.Release()
+	}
+
+	r.file.metadata.LogAccess("system", "read", "record", true, fmt.Sprintf("read %d rows", resultRec.NumRows()))
+
+	return resultRec, nil
 }
 
 // ReadColumns decrypts only the specified columns from the file
@@ -390,11 +434,15 @@ func (r *Reader) ReadColumns(columns []string) (arrow.Record, error) {
 		colSet[c] = struct{}{}
 	}
 
-	var arrays []arrow.Array
-	var fields []arrow.Field
+	type result struct {
+		field arrow.Field
+		arr   arrow.Array
+		err   error
+	}
 
+	var selected []metadata.BlockInfo
+	var selectedFields []arrow.Field
 	schema := r.file.metadata.Schema
-
 	for _, field := range schema.Fields() {
 		if len(colSet) > 0 {
 			if _, ok := colSet[field.Name]; !ok {
@@ -402,7 +450,6 @@ func (r *Reader) ReadColumns(columns []string) (arrow.Record, error) {
 			}
 		}
 
-		// Find block info for this column
 		var blockInfo *metadata.BlockInfo
 		for _, block := range r.file.metadata.BlockInfo {
 			if block.ColumnName == field.Name {
@@ -410,70 +457,104 @@ func (r *Reader) ReadColumns(columns []string) (arrow.Record, error) {
 				break
 			}
 		}
-
 		if blockInfo == nil {
 			return nil, fmt.Errorf("no block info for column %s", field.Name)
 		}
+		selected = append(selected, *blockInfo)
+		selectedFields = append(selectedFields, field)
+	}
 
-		if _, err := r.file.file.Seek(blockInfo.Offset, io.SeekStart); err != nil {
-			return nil, fmt.Errorf("failed to seek to block for column %s: %w", field.Name, err)
-		}
+	results := make([]result, len(selected))
+	var wg sync.WaitGroup
 
-		encryptedData := make([]byte, blockInfo.Length)
-		if _, err := io.ReadFull(r.file.file, encryptedData); err != nil {
-			return nil, fmt.Errorf("failed to read encrypted data for column %s: %w", field.Name, err)
-		}
+	for i, bi := range selected {
+		field := selectedFields[i]
+		wg.Add(1)
+		go func(idx int, f arrow.Field, bi metadata.BlockInfo) {
+			defer wg.Done()
 
-		checksum := sha256.Sum256(encryptedData)
-		if !bytes.Equal(checksum[:], blockInfo.Checksum) {
-			return nil, fmt.Errorf("checksum mismatch for column %s", field.Name)
-		}
+			encryptedData := make([]byte, bi.Length)
+			if _, err := r.file.file.ReadAt(encryptedData, bi.Offset); err != nil {
+				results[idx].err = fmt.Errorf("failed to read encrypted data for column %s: %w", f.Name, err)
+				return
+			}
 
-		encryptor, exists := r.encryptors[field.Name]
-		if !exists {
-			return nil, fmt.Errorf("no encryptor for column %s", field.Name)
-		}
+			checksum := sha256.Sum256(encryptedData)
+			if !bytes.Equal(checksum[:], bi.Checksum) {
+				results[idx].err = fmt.Errorf("%w: checksum mismatch for column %s", ErrCorruptedBlock, f.Name)
+				return
+			}
 
-		decryptedData, err := encryptor.Decrypt(encryptedData)
-		if err != nil {
-			return nil, fmt.Errorf("failed to decrypt column %s: %w", field.Name, err)
-		}
+			encryptor, exists := r.encryptors[f.Name]
+			if !exists {
+				results[idx].err = fmt.Errorf("no encryptor for column %s", f.Name)
+				return
+			}
 
-		reader, err := ipc.NewReader(bytes.NewReader(decryptedData), ipc.WithAllocator(mem))
-		if err != nil {
-			return nil, fmt.Errorf("failed to create reader for column %s: %w", field.Name, err)
-		}
+			dec, err := encryptor.Decrypt(encryptedData)
+			if err != nil {
+				results[idx].err = fmt.Errorf("failed to decrypt column %s: %w", f.Name, err)
+				return
+			}
 
-		rec, err := reader.Read()
-		if err != nil {
-			reader.Release()
-			return nil, fmt.Errorf("failed to read record for column %s: %w", field.Name, err)
-		}
+			reader, err := ipc.NewReader(bytes.NewReader(dec), ipc.WithAllocator(mem))
+			if err != nil {
+				results[idx].err = fmt.Errorf("failed to create reader for column %s: %w", f.Name, err)
+				return
+			}
 
-		if rec.Column(0) == nil {
+			rec, err := reader.Read()
+			if err != nil {
+				reader.Release()
+				results[idx].err = fmt.Errorf("failed to read record for column %s: %w", f.Name, err)
+				return
+			}
+
+			if rec.Column(0) == nil {
+				rec.Release()
+				reader.Release()
+				results[idx].err = fmt.Errorf("nil column data for %s", f.Name)
+				return
+			}
+
+			col := rec.Column(0)
+			col.Retain()
+			results[idx] = result{field: f, arr: col}
 			rec.Release()
 			reader.Release()
-			return nil, fmt.Errorf("nil column data for %s", field.Name)
-		}
+		}(i, field, bi)
+	}
 
-		col := rec.Column(0)
-		col.Retain()
-		arrays = append(arrays, col)
-		fields = append(fields, field)
-		rec.Release()
-		reader.Release()
+	wg.Wait()
+
+	for _, rres := range results {
+		if rres.err != nil {
+			for _, rr := range results {
+				if rr.arr != nil {
+					rr.arr.Release()
+				}
+			}
+			return nil, rres.err
+		}
+	}
+
+	arrays := make([]arrow.Array, len(results))
+	fields := make([]arrow.Field, len(results))
+	for i, rres := range results {
+		arrays[i] = rres.arr
+		fields[i] = rres.field
 	}
 
 	newSchema := arrow.NewSchema(fields, nil)
-	result := array.NewRecord(newSchema, arrays, -1)
+	record := array.NewRecord(newSchema, arrays, -1)
 
 	for _, col := range arrays {
 		col.Release()
 	}
 
-	r.file.metadata.LogAccess("system", "read", "record", true, fmt.Sprintf("read %d rows", result.NumRows()))
+	r.file.metadata.LogAccess("system", "read", "record", true, fmt.Sprintf("read %d rows", record.NumRows()))
 
-	return result, nil
+	return record, nil
 }
 
 // writeHeader writes the file header and initial metadata
@@ -594,4 +675,36 @@ func (lbf *LockboxFile) updateMetadata() error {
 	}
 
 	return nil
+}
+
+// ValidateBlocks verifies the checksum of each data block
+func (lbf *LockboxFile) ValidateBlocks() error {
+	for _, block := range lbf.metadata.BlockInfo {
+		data := make([]byte, block.Length)
+		if _, err := lbf.file.ReadAt(data, block.Offset); err != nil {
+			return fmt.Errorf("failed to read block %s: %w", block.ColumnName, err)
+		}
+		sum := sha256.Sum256(data)
+		if !bytes.Equal(sum[:], block.Checksum) {
+			return fmt.Errorf("%w: %s", ErrCorruptedBlock, block.ColumnName)
+		}
+	}
+	return nil
+}
+
+// Repair attempts to remove corrupted blocks from metadata
+func (lbf *LockboxFile) Repair() error {
+	var valid []metadata.BlockInfo
+	for _, block := range lbf.metadata.BlockInfo {
+		data := make([]byte, block.Length)
+		if _, err := lbf.file.ReadAt(data, block.Offset); err != nil {
+			continue
+		}
+		sum := sha256.Sum256(data)
+		if bytes.Equal(sum[:], block.Checksum) {
+			valid = append(valid, block)
+		}
+	}
+	lbf.metadata.BlockInfo = valid
+	return lbf.updateMetadata()
 }
