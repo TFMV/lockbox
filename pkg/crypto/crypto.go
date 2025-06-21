@@ -228,7 +228,7 @@ func DeriveColumnKey(masterKey []byte, columnName string, salt []byte) []byte {
 // Sign signs data using the Kyber keypair
 func (ce *ColumnEncryptor) Sign(data []byte) ([]byte, error) {
 	if ce.KyberSecretKey == nil {
-		return nil, fmt.Errorf("Kyber secret key not available")
+		return nil, fmt.Errorf("kyber secret key not available")
 	}
 
 	// Create a Schnorr signature using the Kyber keypair
@@ -246,7 +246,7 @@ func (ce *ColumnEncryptor) Sign(data []byte) ([]byte, error) {
 // Verify verifies a signature
 func (ce *ColumnEncryptor) Verify(data, signature []byte) (bool, error) {
 	if ce.KyberPublicKey == nil {
-		return false, fmt.Errorf("Kyber public key not available")
+		return false, fmt.Errorf("kyber public key not available")
 	}
 
 	// Verify the Schnorr signature

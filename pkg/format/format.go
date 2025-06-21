@@ -546,15 +546,15 @@ func (r *Reader) ReadColumns(columns []string) (arrow.Record, error) {
 	}
 
 	newSchema := arrow.NewSchema(fields, nil)
-	result := array.NewRecord(newSchema, arrays, -1)
+	record := array.NewRecord(newSchema, arrays, -1)
 
 	for _, col := range arrays {
 		col.Release()
 	}
 
-	r.file.metadata.LogAccess("system", "read", "record", true, fmt.Sprintf("read %d rows", result.NumRows()))
+	r.file.metadata.LogAccess("system", "read", "record", true, fmt.Sprintf("read %d rows", record.NumRows()))
 
-	return result, nil
+	return record, nil
 }
 
 // writeHeader writes the file header and initial metadata
