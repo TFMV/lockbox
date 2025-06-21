@@ -516,8 +516,10 @@ func loadBlobRecord(blobs map[string]string, schema *arrow.Schema) (arrow.Record
 	builders := make([]array.Builder, len(schema.Fields()))
 	for i, f := range schema.Fields() {
 		switch f.Type.(type) {
-		case *arrow.BinaryType, *arrow.LargeBinaryType:
-			builders[i] = array.NewBinaryBuilder(mem, f.Type)
+		case *arrow.BinaryType:
+			builders[i] = array.NewBinaryBuilder(mem, arrow.BinaryTypes.Binary)
+		case *arrow.LargeBinaryType:
+			builders[i] = array.NewBinaryBuilder(mem, arrow.BinaryTypes.LargeBinary)
 		case *arrow.StringType:
 			builders[i] = array.NewStringBuilder(mem)
 		default:
@@ -533,8 +535,6 @@ func loadBlobRecord(blobs map[string]string, schema *arrow.Schema) (arrow.Record
 			}
 			switch b := builders[i].(type) {
 			case *array.BinaryBuilder:
-				b.Append(data)
-			case *array.LargeBinaryBuilder:
 				b.Append(data)
 			case *array.StringBuilder:
 				b.Append(string(data))
