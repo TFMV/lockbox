@@ -65,16 +65,16 @@ Supported input formats:
 
 		var record arrow.Record
 
-		if len(blobMap) > 0 {
-			record, err = loadBlobRecord(blobMap, lb.Schema())
-			if err != nil {
-				return fmt.Errorf("failed to load blob data: %w", err)
-			}
-		} else if sampleData {
+		if sampleData {
 			// Generate sample data
 			record, err = generateSampleData(lb.Schema())
 			if err != nil {
 				return fmt.Errorf("failed to generate sample data: %w", err)
+			}
+		} else if len(blobMap) > 0 && format == "blob" {
+			record, err = loadBlobRecord(blobMap, lb.Schema())
+			if err != nil {
+				return fmt.Errorf("failed to load blob data: %w", err)
 			}
 		} else if inputFile != "" && format == "csv" {
 			// Load data from file
