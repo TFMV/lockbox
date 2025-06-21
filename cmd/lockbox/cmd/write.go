@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
@@ -17,7 +18,10 @@ import (
 	"github.com/apache/arrow-go/v18/arrow"
 	"github.com/apache/arrow-go/v18/arrow/array"
 	"github.com/apache/arrow-go/v18/arrow/memory"
+	"github.com/apache/arrow-go/v18/parquet/file"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
 	"github.com/spf13/cobra"
+
 	"golang.org/x/term"
 )
 
@@ -40,6 +44,11 @@ Supported input formats:
 		sampleData, _ := cmd.Flags().GetBool("sample")
 		format, _ := cmd.Flags().GetString("format")
 		blobArgs, _ := cmd.Flags().GetStringArray("blob")
+
+		// Make sure pyarrow is installed
+		if err := ensurePyarrowInstalled(); err != nil {
+			return fmt.Errorf("could not ensure pyarrow is installed: %v", err)
+		}
 
 		// Get password if not provided
 		if password == "" {
@@ -88,6 +97,21 @@ Supported input formats:
 			if err != nil {
 				return fmt.Errorf("failed to load data from file: %w", err)
 			}
+		} else if inputFile != "" && format == "orc" {
+			outputfile := strings.TrimSuffix(inputFile, ".orc") + ".parquet"
+
+			// Convert ORC to Parquet using Python script
+			// Note: This requires a Python script `orc2parquet.py` that uses pyarrow to convert ORC to Parquet
+			if err := convertORCtoParquet(inputFile, outputfile); err != nil {
+				return fmt.Errorf("conversion failed: %v", err)
+			}
+
+			// Load data from parquet file
+			record, err = loadDataFromORCToParquet(outputfile, lb.Schema())
+			if err != nil {
+				return fmt.Errorf("failed to load data from file: %w", err)
+			}
+
 		} else {
 			return fmt.Errorf("either --input or --sample must be specified")
 		}
@@ -113,6 +137,80 @@ func init() {
 	writeCmd.Flags().StringP("password", "p", "", "Password for encryption")
 	writeCmd.Flags().Bool("sample", false, "Generate sample data")
 	writeCmd.Flags().StringArray("blob", []string{}, "Blob field mapping field=file")
+}
+
+func convertORCtoParquet(orcFile, parquetFile string) error {
+	cmd := exec.Command("python3", "orc2parquet.py", orcFile, parquetFile)
+	out, err := cmd.CombinedOutput()
+	fmt.Printf("Python conversion output: %s\n", string(out))
+	if err != nil {
+		return fmt.Errorf("ORC to Parquet conversion failed: %w", err)
+	}
+	return nil
+}
+
+// Check and install pyarrow if not present
+func ensurePyarrowInstalled() error {
+	// Try to import pyarrow.orc, fail if not available
+	checkCmd := exec.Command("python3", "-c", "import pyarrow.orc, pyarrow.parquet")
+	if err := checkCmd.Run(); err == nil {
+		return nil // Already installed!
+	}
+	fmt.Println("pyarrow not found. Installing pyarrow with pip...")
+
+	// Try pip3 first
+	installCmd := exec.Command("pip3", "install", "--user", "pyarrow")
+	installCmd.Stdout = nil // or os.Stdout if you want to show output
+	installCmd.Stderr = nil
+	if err := installCmd.Run(); err == nil {
+		return nil // Installed!
+	}
+
+	// Fallback to pip if pip3 fails
+	installCmd = exec.Command("pip", "install", "--user", "pyarrow")
+	if err := installCmd.Run(); err != nil {
+		return fmt.Errorf("failed to install pyarrow: %w", err)
+	}
+	return nil
+}
+
+func concatRecords(mem memory.Allocator, schema *arrow.Schema, records ...arrow.Record) (arrow.Record, error) {
+	if len(records) == 0 {
+		return nil, nil
+	}
+
+	numFields := len(schema.Fields())
+	concatArrays := make([]arrow.Array, numFields)
+
+	for i := 0; i < numFields; i++ {
+		var arraysToConcat []arrow.Array
+		for _, rec := range records {
+			arraysToConcat = append(arraysToConcat, rec.Column(i))
+		}
+		out, err := array.Concatenate(arraysToConcat, mem)
+		if err != nil {
+			// Release any arrays already created
+			for _, arr := range concatArrays {
+				if arr != nil {
+					arr.Release()
+				}
+			}
+			return nil, err
+		}
+		concatArrays[i] = out
+	}
+
+	// Count total rows
+	var totalRows int64
+	for _, rec := range records {
+		totalRows += rec.NumRows()
+	}
+
+	rec := array.NewRecord(schema, concatArrays, totalRows)
+	for _, arr := range concatArrays {
+		arr.Release()
+	}
+	return rec, nil
 }
 
 // generateSampleData creates sample Arrow data matching the schema
@@ -555,4 +653,73 @@ func loadBlobRecord(blobs map[string]string, schema *arrow.Schema) (arrow.Record
 		arr.Release()
 	}
 	return rec, nil
+}
+
+// Loads all data from a Parquet file into a single Arrow Record, matching the given schema
+func loadDataFromORCToParquet(parquetPath string, schema *arrow.Schema) (arrow.Record, error) {
+	f, err := os.Open(parquetPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open parquet file: %w", err)
+	}
+	defer f.Close()
+
+	pf, err := file.NewParquetReader(f)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read parquet file: %w", err)
+	}
+	defer pf.Close()
+
+	mem := memory.NewGoAllocator()
+
+	// Parquet → Arrow reader
+	pqReader, err := pqarrow.NewFileReader(pf, pqarrow.ArrowReadProperties{BatchSize: 1024}, mem)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create parquet reader: %w", err)
+	}
+
+	// Make sure the Parquet file has the needed columns (validate schema)
+	_, err = pqReader.Schema()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get parquet schema: %w", err)
+	}
+
+	// Optionally: Validate or coerce schemas
+	// (See your `coerceRecord` logic for stricter mapping)
+
+	// Read all rows from the Parquet file
+	ctx := context.Background()
+	recReader, err := pqReader.GetRecordReader(ctx, nil, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get record reader: %w", err)
+	}
+	defer recReader.Release()
+
+	// Accumulate all batches into a single record (if needed)
+	var allBatches []arrow.Record
+	for recReader.Next() {
+		rec := recReader.Record()
+		// Coerce to match target schema (if needed)
+		if !rec.Schema().Equal(schema) {
+			coerced, err := lockbox.CoerceRecord(schema, rec)
+			if err != nil {
+				rec.Release()
+				return nil, err
+			}
+			rec.Release()
+			rec = coerced
+		} else {
+			rec.Retain()
+		}
+		allBatches = append(allBatches, rec)
+	}
+	if len(allBatches) == 0 {
+		return nil, fmt.Errorf("no data found in Parquet file")
+	}
+
+	// Concatenate batches into one (if more than one)
+	result, err := concatRecords(mem, schema, allBatches...)
+	for _, rec := range allBatches {
+		rec.Release()
+	}
+	return result, nil
 }
